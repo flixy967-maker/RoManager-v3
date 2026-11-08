@@ -104,17 +104,17 @@ DEFAULTS = {
     # appearance
     "theme": "Midnight", "accent": "", "ui_scale": "100", "radius": "14", "density": "Comfortable",
     "font": "Segoe UI", "opacity": "100", "topmost": "0", "show_avatars": "1", "show_bars": "1",
-    "cols": "1", "anim": "1", "sidebar_small": "0",
+    "cols": "1", "anim": "0", "sidebar_small": "0",
     # general / launch / recovery
     "start_min": "0", "autostart": "0", "delay": "8", "default_dest": "",
     "auto": "0", "max_attempts": "3", "restart_delay": "15", "multi": "1",
     # performance
-    "preset": "balanced", "interval": "2", "monitor": "0",
+    "preset": "lowest", "interval": "5", "monitor": "0",
     "c_prio": "Normal", "c_w": "0", "c_h": "0", "c_automin": "0",
     "p_eco": "0", "p_cores": "0", "p_bg": "0", "p_trim": "0", "p_mem": "0",
-    "p_gpu": "default", "p_gfx": "0", "p_fps": "0",
+    "p_gpu": "default", "p_gfx": "0", "p_fps": "0", "p_gpucap": "0",
     "isolate": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
-    "ui_iv": "2", "ui_pause": "1", "self_eco": "1", "prev_on": "1", "prev_iv": "5",
+    "ui_iv": "3", "ui_pause": "1", "self_eco": "1", "prev_on": "0", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
     "lock_hash": "",
@@ -140,6 +140,15 @@ MIGRATIONS = [
         attempt INTEGER, result TEXT);
     COMMIT;""",
     """BEGIN; ALTER TABLE accounts ADD COLUMN pw_enc BLOB; COMMIT;""",
+    """BEGIN;
+    INSERT INTO settings(key,value) VALUES
+      ('preset','lowest'),('interval','5'),('anim','0'),('prev_on','0'),('ui_iv','3'),('ui_pause','1'),('self_eco','1'),
+      ('c_prio','Below normal'),('c_w','320'),('c_h','180'),('p_eco','1'),('p_cores','1'),('p_bg','1'),('p_trim','1'),
+      ('p_mem','1'),('p_gpu','power'),('p_gfx','1'),('p_fps','45'),('p_cap','20')
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+    COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES('p_cap','5'),('p_gpucap','5')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
 ]
 
 
@@ -641,7 +650,17 @@ PRESET_DEFS = {
                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=20, cpucap=25, interval=5),
     "minimal": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
                     bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=15, cpucap=10, interval=5),
+    "lowest": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
+                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, interval=5),
 }
+
+
+MIN_SETTINGS = ('<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" '
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                'xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">\n'
+                '\t<External>null</External>\n\t<External>nil</External>\n'
+                '\t<Item class="UserGameSettings" referent="RBX0">\n\t\t<Properties>\n\t\t</Properties>\n'
+                '\t</Item>\n</roblox>\n')
 
 
 class JOB_CPU_RATE(ctypes.Structure):
@@ -711,6 +730,59 @@ def os_set_cap(c, pct):
     return bool(kernel32.SetInformationJobObject(c["job"], 15, ctypes.byref(info), ctypes.sizeof(info)))
 
 
+class PDH_VALUE(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+class PDH_ITEM(ctypes.Structure):
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", PDH_VALUE)]
+
+
+pdh = ctypes.windll.pdh
+pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+
+
+def gpu_usage_by_pid():
+    """GPU % per process (busiest engine, like Task Manager) from the Windows 'GPU Engine' performance
+    counters. Returns None when this PC does not provide them."""
+    q = ctypes.c_void_p()
+    if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+        return None
+    try:
+        c = ctypes.c_void_p()
+        if pdh.PdhAddEnglishCounterW(q, r"\GPU Engine(*)\Utilization Percentage", 0, ctypes.byref(c)) != 0:
+            return None
+        pdh.PdhCollectQueryData(q)
+        time.sleep(0.4)
+        pdh.PdhCollectQueryData(q)
+        size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+        r = pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(count), None)
+        if (r & 0xFFFFFFFF) != 0x800007D2 or not size.value:  # PDH_MORE_DATA
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+            return None
+        items = ctypes.cast(buf, ctypes.POINTER(PDH_ITEM))
+        eng = {}
+        for i in range(count.value):
+            it = items[i]
+            m = re.match(r"pid_(\d+)_.*?engtype_(\w+)", it.szName or "")
+            if m and it.FmtValue.CStatus in (0, 1):
+                key = (int(m.group(1)), m.group(2))
+                eng[key] = eng.get(key, 0.0) + it.FmtValue.doubleValue
+        out = {}
+        for (pid, _t), v in eng.items():
+            out[pid] = max(out.get(pid, 0.0), v)
+        return out
+    finally:
+        pdh.PdhCloseQuery(q)
+
+
 def roblox_exes():
     roots = [Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "Versions",
              Path(os.environ.get("ProgramFiles(x86)", "")) / "Roblox" / "Versions"]
@@ -739,6 +811,8 @@ class Core:
         self.attempts = {}
         self.failed = 0
         self.mutex = None
+        self.holder = None
+        self.multi_status = "Multi-instance is off."
         self.last_net = None
         self.qs = {"running": False, "total": 0, "done": 0, "failed": 0}
         self.pause_ev = threading.Event()
@@ -755,6 +829,7 @@ class Core:
     def start(self):
         psutil.cpu_percent(None)
         threading.Thread(target=self.sample_loop, daemon=True).start()
+        threading.Thread(target=self.gpu_loop, daemon=True).start()
         if self.db.flag("multi"):
             self.log(self.set_multi(True))
 
@@ -780,27 +855,55 @@ class Core:
         threading.Thread(target=send, daemon=True).start()
 
     # -- multi-instance (holds Roblox's documented-by-observation named mutex in OUR process)
-    def set_multi(self, on):
-        if not on:
-            if self.mutex:
-                kernel32.CloseHandle(ctypes.c_void_p(self.mutex))
-                self.mutex = None
-            return "Multi-instance off."
-        if self.mutex:
-            return "Multi-instance already on."
+    def _hold(self, info):
+        """Owns Roblox's two single-instance kernel objects (a named mutex and a named event) in OUR process,
+        from one long-lived thread (a mutex belongs to the thread that created it). Nothing in Roblox is touched."""
+        res = info["res"]
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.CreateMutexW.restype = ctypes.c_void_p
         k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-        h = k.CreateMutexW(None, True, "ROBLOX_singletonMutex")
-        err = ctypes.get_last_error()
-        if not h:
-            return "Could not create the instance mutex."
-        if err == 183:  # Roblox already owns it
-            kernel32.CloseHandle(ctypes.c_void_p(h))
-            return ("Roblox is already running and owns the instance mutex. Close every Roblox window; "
-                    "RoManager retries before each launch queue.")
-        self.mutex = h
-        return "Multi-instance on."
+        k.CreateEventW.restype = ctypes.c_void_p
+        k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        m = k.CreateMutexW(None, True, "ROBLOX_singletonMutex")
+        em = ctypes.get_last_error()
+        ev = k.CreateEventW(None, True, False, "ROBLOX_singletonEvent")
+        ee = ctypes.get_last_error()
+        if not m or not ev:
+            res["msg"] = "Windows would not create the single-instance objects."
+        elif em == 183 or ee == 183:
+            res["msg"] = ("Roblox is already running and owns its single-instance objects. Close every Roblox "
+                          "window, then turn multi-instance on (or start RoManager before Roblox).")
+        else:
+            res["ok"] = True
+        info["ready"].set()
+        if res.get("ok"):
+            info["stop"].wait()
+        for h in (m, ev):
+            if h:
+                k.CloseHandle(h)
+
+    def set_multi(self, on):
+        if not on:
+            if self.holder:
+                self.holder["stop"].set()
+                self.holder = None
+            self.mutex = None
+            self.multi_status = "Multi-instance is off."
+            return self.multi_status
+        if self.holder:
+            return self.multi_status
+        info = {"stop": threading.Event(), "ready": threading.Event(), "res": {}}
+        threading.Thread(target=self._hold, args=(info,), daemon=True).start()
+        info["ready"].wait(5)
+        if info["res"].get("ok"):
+            self.holder, self.mutex = info, True
+            self.multi_status = "Multi-instance ON: RoManager holds Roblox's single-instance mutex and event."
+        else:
+            info["stop"].set()
+            self.mutex = None
+            self.multi_status = info["res"].get("msg", "Could not start multi-instance.")
+        return self.multi_status
 
     # -- launching
     def launch_one(self, aid, dest):
@@ -810,31 +913,21 @@ class Core:
         if not acc:
             raise RuntimeError("Account no longer exists.")
         name = acc["alias"] or acc["username"]
+        iso = self.db.flag("isolate")
         try:
             cookie = dpapi_unprotect(acc["cookie_enc"]).decode()
-            ticket = auth_ticket(cookie)
             self.resolve_dest(cookie, dest)
+            pid = self._start_client(acc, cookie, dest, iso)
+            if pid is None and iso:
+                self.log(f"{name}: the isolated start produced no client, retrying with the standard launcher.", "warn")
+                pid = self._start_client(acc, cookie, dest, False)
         except AuthExpired:
             self.db.q("UPDATE accounts SET status='Expired' WHERE id=?", (aid,))
             raise
         finally:
             cookie = None
-        before = roblox_pids()
-        uri = build_uri(ticket, dest)
-        if self.db.flag("isolate"):
-            self.launch_isolated(acc, uri)
-        else:
-            os.startfile(uri)
-        pid, end = None, time.time() + 60
-        while pid is None and time.time() < end and not self.stop:
-            time.sleep(1)
-            with self.lock:
-                tracked = set(self.clients)
-            new = roblox_pids() - before - tracked
-            if new:
-                pid = min(new)
         if pid is None:
-            raise RuntimeError("Roblox did not start within 60s (updating? multi-instance blocked?).")
+            raise RuntimeError("Roblox did not start. If another client is open, read the multi-instance status on the Play tab.")
         c = {"pid": pid, "account_id": aid, "name": name, "dest": dest, "start": time.time(),
              "proc": psutil.Process(pid), "cpu": 0.0, "rss": 0, "hwnd": None, "hung": 0, "expected": False,
              "tuned": None, "sized": None, "last_trim": 0.0, "denied": set()}
@@ -846,6 +939,30 @@ class Core:
         self.db.q("UPDATE accounts SET last_used=?, status='Valid' WHERE id=?", (time.time(), aid))
         threading.Thread(target=self.apply_when_ready, args=(pid,), daemon=True).start()
         return pid
+
+    def _start_client(self, acc, cookie, dest, isolated):
+        ticket = auth_ticket(cookie)  # tickets are single-use, so every attempt asks for a fresh one
+        before = roblox_pids()
+        uri = build_uri(ticket, dest)
+        if isolated:
+            self.launch_isolated(acc, uri)
+        else:
+            os.startfile(uri)
+        end = time.time() + (30 if isolated else 60)
+        while time.time() < end and not self.stop:
+            time.sleep(1)
+            with self.lock:
+                tracked = set(self.clients)
+            new = roblox_pids() - before - tracked
+            if new:
+                return min(new)
+        return None
+
+    def _check_kill(self, others, name):
+        dead = [p for p in others if not psutil.pid_exists(p)]
+        if dead:
+            self.log(f"{len(dead)} other client(s) closed when {name} started, so Roblox's single-instance lock is "
+                     f"still active. Status: {self.multi_status}", "bad")
 
     def resolve_dest(self, cookie, dest):
         if dest.get("share_code") and not dest.get("place_id"):
@@ -867,6 +984,8 @@ class Core:
         if not dst.exists() and src.exists():
             shutil.copy2(src, dst)
         pr = self.profile()
+        if not dst.exists() and (pr["gfx"] or pr["fps"]):
+            dst.write_text(MIN_SETTINGS, encoding="utf-8")
         if (pr["gfx"] or pr["fps"]) and dst.exists():
             try:
                 self.edit_roblox_settings(pr["gfx"], pr["fps"], dst)
@@ -910,6 +1029,9 @@ class Core:
                 self.db.q("INSERT INTO launch_history(account_id,dest,ts,ok) VALUES(?,?,?,1)",
                           (aid, dest_label(dest), time.time()))
                 self.log(f"{name}: started (PID {pid})", "ok")
+                others = {c["pid"] for c in self.snapshot() if c["pid"] != pid}
+                if others:
+                    threading.Timer(8, self._check_kill, args=(others, name)).start()
             except Exception as e:
                 self.qs["failed"] += 1
                 self.failed += 1
@@ -1043,7 +1165,9 @@ class Core:
                      cores=self.db.num("p_cores", 0, NCPU), bgthrottle=self.db.flag("p_bg"),
                      trim=self.db.flag("p_trim"), memprio=self.db.flag("p_mem"), gpu=self.db.get("p_gpu"),
                      gfx=self.db.num("p_gfx", 0, 10), fps=self.db.num("p_fps", 0, 240),
-                     cpucap=self.db.num("p_cap", 0, 100), interval=None)
+                     cpucap=self.db.num("p_cap", 0, 100),
+                     gpucap=self.db.num("p_gpucap", 0, 100), interval=None)
+        d.setdefault("gpucap", 0)
         d["prio_class"] = PRIO.get(d["prio"], psutil.NORMAL_PRIORITY_CLASS)
         d["interval"] = max(d["interval"], iv) if d["interval"] else iv
         return d
@@ -1189,18 +1313,25 @@ class Core:
                 bak.write_text(txt, encoding="utf-8")
         done = []
 
-        def sub(pattern, val, label):
+        def sub(pattern, val, label, tag):
             nonlocal txt
             new, n = re.subn(pattern, lambda m: m.group(1) + str(val) + m.group(2), txt)
             if n:
                 txt = new
-                done.append(label)
+            elif "</Properties>" in txt:
+                txt = txt.replace("</Properties>", "\t" + tag.format(val) + "\n\t\t</Properties>", 1)
+            else:
+                return
+            done.append(label)
 
         if gfx:
-            sub(r'(<int name="GraphicsQualityLevel">)-?\d+(</int>)', 2 * gfx - 1, f"graphics quality {gfx}/10")
-            sub(r'(<token name="SavedQualityLevel">)-?\d+(</token>)', gfx, "quality mode")
+            sub(r'(<int name="GraphicsQualityLevel">)-?\d+(</int>)', 2 * gfx - 1, f"graphics quality {gfx}/10",
+                '<int name="GraphicsQualityLevel">{}</int>')
+            sub(r'(<token name="SavedQualityLevel">)-?\d+(</token>)', gfx, "quality mode",
+                '<token name="SavedQualityLevel">{}</token>')
         if fps:
-            sub(r'(<int name="FramerateCap">)-?\d+(</int>)', fps, f"FPS cap {fps}")
+            sub(r'(<int name="FramerateCap">)-?\d+(</int>)', fps, f"FPS cap {fps}",
+                '<int name="FramerateCap">{}</int>')
         path.write_text(txt, encoding="utf-8")
         return ("Roblox settings updated: " + ", ".join(done) + ".") if done else \
             "Roblox settings file has no matching keys; nothing changed."
@@ -1214,6 +1345,45 @@ class Core:
             raise RuntimeError("No backup found (nothing was changed yet).")
         path.write_text(bak.read_text(encoding="utf-8"), encoding="utf-8")
         self.log("Original Roblox graphics settings restored.", "ok")
+
+    # -- GPU target (Windows cannot hard-cap another program's GPU, so measure and steer the render size)
+    def gpu_loop(self):
+        while not self.stop:
+            time.sleep(4)
+            try:
+                pr = self.profile()
+                cl = self.snapshot()
+                if pr["gpucap"] and cl:
+                    self.gpu_control(cl, pr)
+            except Exception as e:
+                self.log(f"GPU control error: {e}")
+
+    def gpu_control(self, cl, pr):
+        target = pr["gpucap"]
+        usage = gpu_usage_by_pid()
+        if usage is None:
+            if not getattr(self, "_gpu_warned", False):
+                self._gpu_warned = True
+                self.log("This PC does not provide per-process GPU counters, so the GPU target cannot be enforced "
+                         "(window size, graphics quality and FPS cap still apply).", "warn")
+            return
+        for c in cl:
+            h = c["hwnd"]
+            if not h or user32.IsIconic(h):
+                continue
+            g = usage.get(c["pid"], 0.0)
+            c["gpu"] = g
+            base = tuple(pr["size"]) if pr["size"] else c.setdefault("gbase", tuple(win_rect(h)[2:]))
+            sc = c.get("gscale", 1.0)
+            if g > target * 1.15:
+                sc = max(0.03, sc * 0.8)
+            elif g < target * 0.5 and sc < 1.0:
+                sc = min(1.0, sc * 1.15)
+            else:
+                continue
+            c["gscale"] = sc
+            x, y = (0, 0) if c.get("embedded") else win_rect(h)[:2]
+            win_place(h, x, y, max(32, int(base[0] * sc)), max(18, int(base[1] * sc)))
 
     # -- monitoring + recovery
     def sample_loop(self):
@@ -1767,7 +1937,7 @@ class HomePage(Page):
         pl.pack(side="right")
         bars = {}
         if self.core.db.flag("show_bars"):
-            for k, name in (("cpu", "CPU"), ("ram", "RAM")):
+            for k, name in (("cpu", "CPU"), ("ram", "RAM"), ("gpu", "GPU")):
                 r = ctk.CTkFrame(body, fg_color="transparent")
                 r.pack(fill="x", pady=(8 if k == "cpu" else 2, 0))
                 L(r, name, 11, True, muted=True, width=34, anchor="w").pack(side="left")
@@ -1829,12 +1999,15 @@ class HomePage(Page):
                 txt, col = "Running", OK
             k["pill"].configure(text=f" {txt} ", text_color=col, fg_color=blend(col, T["panel"], .16))
             k["game"].configure(text=f"Place {dest_label(c['dest'])}")
-            k["meta"].configure(text=f"PID {c['pid']}   ·   up {fmt_dur(time.time() - c['start'])}   ·   window: {state.lower()}   ·   FPS n/a")
+            k["meta"].configure(text=f"PID {c['pid']}   ·   up {fmt_dur(time.time() - c['start'])}   ·   window: {state.lower()}")
             if "cpu" in k["bars"]:
                 k["bars"]["cpu"][0].set(min(1, c["cpu"] * 4 / 100))
                 k["bars"]["cpu"][1].configure(text=f"{c['cpu']:.1f}%")
                 k["bars"]["ram"][0].set(min(1, c["rss"] / 3e9))
                 k["bars"]["ram"][1].configure(text=fmt_mb(c["rss"]))
+                g = c.get("gpu")
+                k["bars"]["gpu"][0].set(min(1, (g or 0) * 4 / 100))
+                k["bars"]["gpu"][1].configure(text="n/a" if g is None else f"{g:.1f}%")
             img = self.app.avatar(c["account_id"]) if self.core.db.flag("show_avatars") else None
             if img and k["avimg"] is not img:
                 k["avimg"] = img
@@ -2277,6 +2450,8 @@ class PlayPage(Page):
         if self.core.db.flag("isolate"):
             self.iso.select()
         self.iso.pack(side="left")
+        self.multi_lbl = L(pad, "", 11, muted=True, justify="left", wraplength=520)
+        self.multi_lbl.pack(anchor="w", pady=(4, 0))
         d0 = max(0, min(120, int(float(self.core.db.get("delay") or 8))))
         self.delay = slider_row(pad, "Delay between launches", 0, 120, 120, d0, lambda v: f"{int(v)} s")
         self.sel = L(pad, "", 12, muted=True, justify="left", wraplength=520)
@@ -2333,9 +2508,19 @@ class PlayPage(Page):
         m = self.core.set_multi(on)
         self.core.log(m)
         if on and not self.core.mutex:
-            self.multi.deselect()
-            self.core.db.set("multi", "0")
-            messagebox.showwarning(APP_NAME, m)
+            if roblox_pids() and messagebox.askyesno(APP_NAME, m + "\n\nClose all running Roblox windows now and try again?"):
+                for p in roblox_pids():
+                    try:
+                        psutil.Process(p).terminate()
+                    except psutil.Error:
+                        pass
+                time.sleep(2)
+                m = self.core.set_multi(True)
+                self.core.log(m)
+            if not self.core.mutex:
+                self.multi.deselect()
+                self.core.db.set("multi", "0")
+                messagebox.showwarning(APP_NAME, m)
 
     def fav(self):
         try:
@@ -2377,6 +2562,7 @@ class PlayPage(Page):
         self.validate()
 
     def refresh(self):
+        self.multi_lbl.configure(text=self.core.multi_status, text_color=OK if self.core.mutex else WARN)
         names = [(r["alias"] or r["username"]) for r in self.core.db.all("SELECT username, alias, id FROM accounts") if r["id"] in self.app.selected]
         self.sel.configure(text=f"Launching with {len(names)} account(s): " + (", ".join(names[:8]) + ("…" if len(names) > 8 else "") if names else "none selected yet"))
         q = self.core.qs
@@ -2765,7 +2951,7 @@ class MultiViewPage(Page):
                                 break
         except Exception:
             pass
-        self.after(120, self.follow)
+        self.after(120 if self.active else 1500, self.follow)
 
     # -- tiles
     def make_tile(self, c):
@@ -2902,21 +3088,22 @@ class PerfPage(Page):
     def __init__(self, parent, app):
         super().__init__(parent, app, "Performance", "Make every Roblox client use less CPU and GPU")
         db = self.core.db
-        self.sel = db.get("preset") if db.get("preset") in ("balanced", "low", "ultra", "minimal") else "custom"
+        self.sel = db.get("preset") if db.get("preset") in ("balanced", "low", "ultra", "minimal", "lowest") else "custom"
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
-        row.grid_columnconfigure(tuple(range(5)), weight=1, uniform="pp")
+        row.grid_columnconfigure(tuple(range(6)), weight=1, uniform="pp")
         self.pcards = {}
         info = {"balanced": ("Balanced", "Windows defaults. Nothing is throttled."),
                 "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients in efficiency mode."),
                 "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, efficiency mode, {max(1, NCPU // 2)} core(s) each, power-saving GPU."),
                 "minimal": ("Minimal", "10% CPU cap, 320×180, 15 FPS, graphics 1/10, 1 core each, efficiency mode, memory trim. As light as it gets."),
+                "lowest": ("Lowest · 5% / 5%", "5% CPU and 5% GPU max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
                 "custom": ("Custom", "Every option below, your values.")}
-        for i, k in enumerate(("balanced", "low", "ultra", "minimal", "custom")):
+        for i, k in enumerate(("balanced", "low", "ultra", "minimal", "lowest", "custom")):
             f = card(row)
             f.grid(row=0, column=i, sticky="nsew", padx=4)
             L(f, info[k][0], 15, True).pack(anchor="w", padx=14, pady=(12, 2))
-            L(f, info[k][1], 11, muted=True, wraplength=170, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
+            L(f, info[k][1], 11, muted=True, wraplength=140, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
             for w in [f] + list(f.winfo_children()):
                 w.bind("<Button-1>", lambda e, k=k: self.choose(k))
             self.pcards[k] = f
@@ -2964,7 +3151,9 @@ class PerfPage(Page):
         self.cw.append(self.gpu)
         self.gfx = slider_row(b, "Graphics quality (0 = leave as is)", 0, 10, 10, db.num("p_gfx", 0, 10), lambda v: "unchanged" if int(v) == 0 else f"{int(v)} / 10")
         self.fps = slider_row(b, "FPS cap (0 = leave as is)", 0, 240, 24, db.num("p_fps", 0, 240), lambda v: "unchanged" if int(v) == 0 else f"{int(v)} FPS")
-        self.cw += [self.gfx, self.fps]
+        self.gpucap = slider_row(b, "GPU target per client (0 = off)", 0, 100, 100, db.num("p_gpucap", 0, 100),
+                                 lambda v: "off" if int(v) == 0 else f"{int(v)}% max")
+        self.cw += [self.gfx, self.fps, self.gpucap]
         r = ctk.CTkFrame(b, fg_color="transparent")
         r.pack(fill="x", pady=6)
         L(r, "Window size (any size)", 12).pack(side="left")
@@ -2983,7 +3172,7 @@ class PerfPage(Page):
         self.automin.pack(anchor="w", pady=6)
         self.cw.append(self.automin)
         L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, a Windows job-object hard CPU cap, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written to each account's isolated profile (or, without isolation, while no client is running; a backup is kept).\n"
-              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Smaller windows and lower quality cut GPU load the most.",
+              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target.",
           11, muted=True, wraplength=900, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x")
@@ -3011,6 +3200,7 @@ class PerfPage(Page):
             db.set(key, "1" if sw.get() else "0")
         db.set("p_cores", int(self.cores.get()))
         db.set("p_cap", int(self.cap.get()))
+        db.set("p_gpucap", int(self.gpucap.get()))
         db.set("interval", int(self.iv.get()))
         db.set("p_gpu", {"System default": "default", "Power saving": "power", "High performance": "high"}[self.gpu.get()])
         db.set("p_gfx", int(self.gfx.get()))
@@ -3248,8 +3438,10 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build()
         self.show("Home")
-        self.after(100, self.pump)
+        self.after(200, self.pump)
         self.after(1200, self.tick)
+        if core.db.flag("multi") and not core.mutex:
+            self.after(900, lambda: self.toast(core.multi_status, "warn"))
         if core.db.flag("anim"):
             self.attributes("-alpha", 0.0)
             self.fade(0)
@@ -3275,7 +3467,7 @@ class App(ctk.CTk):
         self.toasts = []
         self.configure(fg_color=T["bg"])
         self.attributes("-topmost", db.flag("topmost"))
-        if not db.flag("anim"):
+        if not db.flag("anim") and db.num("opacity", 50, 100) < 100:
             self.attributes("-alpha", db.num("opacity", 50, 100) / 100)
         small = db.flag("sidebar_small")
         self.grid_columnconfigure(1, weight=1)
@@ -3376,7 +3568,7 @@ class App(ctk.CTk):
                     self.core.log(f"UI error: {e}")
         except queue.Empty:
             pass
-        self.after(100, self.pump)
+        self.after(200, self.pump)
 
     def ui(self, fn):
         self.uiq.put(fn)
@@ -3499,6 +3691,10 @@ def main():
     apply_theme(core.db)
     if core.db.get("lock_hash") and not unlock(core):
         return
+    try:
+        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # the manager never needs to outrun the games
+    except psutil.Error:
+        pass
     core.start()
     App(core).mainloop()
 
