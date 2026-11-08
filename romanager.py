@@ -50,6 +50,7 @@ kernel32.CreateJobObjectW.restype = ctypes.c_void_p
 kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
 kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+kernel32.SetProcessWorkingSetSizeEx.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
 
 # ----------------------------------------------------------------- DPAPI ---
 class DATA_BLOB(ctypes.Structure):
@@ -112,9 +113,9 @@ DEFAULTS = {
     "preset": "lowest", "interval": "5", "monitor": "0",
     "c_prio": "Normal", "c_w": "0", "c_h": "0", "c_automin": "0",
     "p_eco": "0", "p_cores": "0", "p_bg": "0", "p_trim": "0", "p_mem": "0",
-    "p_gpu": "default", "p_gfx": "0", "p_fps": "0", "p_gpucap": "0",
+    "p_gpu": "default", "p_gfx": "0", "p_fps": "0", "p_gpucap": "0", "p_ramcap": "0",
     "isolate": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
-    "ui_iv": "3", "ui_pause": "1", "self_eco": "1", "prev_on": "0", "prev_iv": "5",
+    "ui_iv": "3", "ui_pause": "1", "self_eco": "1", "self_eco_always": "1", "prev_on": "0", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
     "lock_hash": "",
@@ -149,6 +150,10 @@ MIGRATIONS = [
     COMMIT;""",
     """BEGIN; INSERT INTO settings(key,value) VALUES('p_cap','5'),('p_gpucap','5')
        ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES('self_eco_always','1'),('c_automin','1')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES('p_ramcap','100')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
 ]
 
 
@@ -156,6 +161,7 @@ class DB:
     def __init__(self):
         APPDIR.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._cache = {}
         self.c = self._open(APPDIR / "romanager.db")
         ver = self.c.execute("PRAGMA user_version").fetchone()[0]
         for i, sql in enumerate(MIGRATIONS[ver:], start=ver + 1):
@@ -222,12 +228,17 @@ class DB:
             return self.c.execute(sql, args).fetchone()
 
     def get(self, k):
+        if k in self._cache:
+            return self._cache[k]
         r = self.one("SELECT value FROM settings WHERE key=?", (k,))
-        return r[0] if r else DEFAULTS.get(k, "")
+        v = r[0] if r else DEFAULTS.get(k, "")
+        self._cache[k] = v
+        return v
 
     def set(self, k, v):
         self.q("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                (k, str(v)))
+        self._cache[k] = str(v)
 
     def flag(self, k):
         return self.get(k) == "1"
@@ -650,8 +661,8 @@ PRESET_DEFS = {
                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=20, cpucap=25, interval=5),
     "minimal": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
                     bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=15, cpucap=10, interval=5),
-    "lowest": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
-                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, interval=5),
+    "lowest": dict(prio="Below normal", size=(320, 180), automin=True, eco=True, cores=1,
+                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, ramcap=100, interval=5),
 }
 
 
@@ -700,6 +711,20 @@ def os_trim(pid):
         return False
     try:
         return bool(psapi.EmptyWorkingSet(h))
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def os_set_ramcap(pid, mb):
+    """Hard working-set limit (documented SetProcessWorkingSetSizeEx). Windows keeps at most `mb` MB of the
+    process in physical RAM and pages the rest out. 0 lifts the limit."""
+    h = _handle(pid, 0x0100 | 0x0400)  # PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION
+    if not h:
+        return False
+    try:
+        if mb <= 0:  # HARDWS_MIN_DISABLE | HARDWS_MAX_DISABLE
+            return bool(kernel32.SetProcessWorkingSetSizeEx(h, 1 << 20, 64 << 30, 0x2 | 0x8))
+        return bool(kernel32.SetProcessWorkingSetSizeEx(h, 1 << 20, int(mb) << 20, 0x2 | 0x4))  # MIN_DISABLE | MAX_ENABLE
     finally:
         kernel32.CloseHandle(h)
 
@@ -1166,8 +1191,10 @@ class Core:
                      trim=self.db.flag("p_trim"), memprio=self.db.flag("p_mem"), gpu=self.db.get("p_gpu"),
                      gfx=self.db.num("p_gfx", 0, 10), fps=self.db.num("p_fps", 0, 240),
                      cpucap=self.db.num("p_cap", 0, 100),
-                     gpucap=self.db.num("p_gpucap", 0, 100), interval=None)
+                     gpucap=self.db.num("p_gpucap", 0, 100),
+                     ramcap=self.db.num("p_ramcap", 0, 8000), interval=None)
         d.setdefault("gpucap", 0)
+        d.setdefault("ramcap", 0)
         d["prio_class"] = PRIO.get(d["prio"], psutil.NORMAL_PRIORITY_CLASS)
         d["interval"] = max(d["interval"], iv) if d["interval"] else iv
         return d
@@ -1185,7 +1212,7 @@ class Core:
         eco = bool(pr["eco"] or (bg and pr["bgthrottle"]))
         now = time.time()
         do_trim = bg and pr["trim"] and now - c["last_trim"] > 60
-        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), pr["cpucap"])
+        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), pr["cpucap"], pr["ramcap"])
         if c["tuned"] == state and not do_trim:
             return
         pid = c["pid"]
@@ -1204,6 +1231,11 @@ class Core:
                     c["mem_set"] = pr["memprio"]
                 elif pr["memprio"]:
                     self._deny(c, "low memory priority")
+            if pr["ramcap"] or c.get("ram_set"):
+                if os_set_ramcap(pid, pr["ramcap"]):
+                    c["ram_set"] = pr["ramcap"] > 0
+                elif pr["ramcap"]:
+                    self._deny(c, "RAM limit")
             if pr["cpucap"] or c.get("cap_set"):
                 if os_set_cap(c, pr["cpucap"]):
                     c["cap_set"] = pr["cpucap"] > 0
@@ -1348,13 +1380,15 @@ class Core:
 
     # -- GPU target (Windows cannot hard-cap another program's GPU, so measure and steer the render size)
     def gpu_loop(self):
+        wait = 4
         while not self.stop:
-            time.sleep(4)
+            time.sleep(wait)
+            wait = 10  # relaxed, unless a client needed adjusting
             try:
                 pr = self.profile()
                 cl = self.snapshot()
-                if pr["gpucap"] and cl:
-                    self.gpu_control(cl, pr)
+                if pr["gpucap"] and cl and self.gpu_control(cl, pr):
+                    wait = 4
             except Exception as e:
                 self.log(f"GPU control error: {e}")
 
@@ -1367,6 +1401,7 @@ class Core:
                 self.log("This PC does not provide per-process GPU counters, so the GPU target cannot be enforced "
                          "(window size, graphics quality and FPS cap still apply).", "warn")
             return
+        changed = False
         for c in cl:
             h = c["hwnd"]
             if not h or user32.IsIconic(h):
@@ -1382,13 +1417,16 @@ class Core:
             else:
                 continue
             c["gscale"] = sc
+            changed = True
             x, y = (0, 0) if c.get("embedded") else win_rect(h)[:2]
             win_place(h, x, y, max(32, int(base[0] * sc)), max(18, int(base[1] * sc)))
+        return changed
 
     # -- monitoring + recovery
     def sample_loop(self):
         while not self.stop:
-            time.sleep(self.profile()["interval"])
+            iv = self.profile()["interval"]
+            time.sleep(iv if self.clients else max(iv, 10))
             try:
                 self.sample()
             except Exception as e:
@@ -1404,15 +1442,17 @@ class Core:
             up, down = (net.bytes_sent - self.last_net[1]) / dt, (net.bytes_recv - self.last_net[2]) / dt
         self.last_net = (now, net.bytes_sent, net.bytes_recv)
         cl = self.snapshot()
-        wins = find_windows({c["pid"] for c in cl}) if cl else {}
+        need = {c["pid"] for c in cl if not c["hwnd"] or not user32.IsWindow(c["hwnd"])}
+        wins = find_windows(need) if need else {}
         per, rb_cpu, rb_ram = {}, 0.0, 0
         for c in cl:
             p = c["proc"]
             try:
-                if not p.is_running() or p.status() == psutil.STATUS_ZOMBIE:
-                    raise psutil.NoSuchProcess(c["pid"])
-                c["cpu"] = p.cpu_percent(None) / NCPU
-                c["rss"] = p.memory_info().rss
+                with p.oneshot():
+                    if not p.is_running() or p.status() == psutil.STATUS_ZOMBIE:
+                        raise psutil.NoSuchProcess(c["pid"])
+                    c["cpu"] = p.cpu_percent(None) / NCPU
+                    c["rss"] = p.memory_info().rss
                 c["hwnd"] = wins.get(c["pid"], c["hwnd"])
                 per[c["pid"]] = (c["cpu"], c["rss"])
                 rb_cpu += c["cpu"]
@@ -1581,6 +1621,34 @@ def hexrgb(h):
 def blend(a, b, t):
     ra, rb = hexrgb(a), hexrgb(b)
     return "#%02x%02x%02x" % tuple(int(ra[i] * t + rb[i] * (1 - t)) for i in range(3))
+
+
+_NA = object()
+_label_cfg = ctk.CTkLabel.configure
+_bar_set = ctk.CTkProgressBar.set
+
+
+def _lazy_label_cfg(self, *args, **kw):
+    """Skip redraws when a label is set to what it already shows (most refresh work is exactly that)."""
+    if args or "require_redraw" in kw:
+        return _label_cfg(self, *args, **kw)
+    cache = self.__dict__.setdefault("_cc", {})
+    ch = {k: v for k, v in kw.items() if cache.get(k, _NA) != v}
+    if not ch:
+        return None
+    cache.update(ch)
+    return _label_cfg(self, **ch)
+
+
+def _lazy_bar_set(self, value, *args, **kw):
+    if abs(getattr(self, "_lv", -1.0) - value) < 0.004:
+        return None
+    self._lv = value
+    return _bar_set(self, value, *args, **kw)
+
+
+ctk.CTkLabel.configure = _lazy_label_cfg
+ctk.CTkProgressBar.set = _lazy_bar_set
 
 
 def apply_theme(db):
@@ -1762,6 +1830,9 @@ class Spark(ctk.CTkCanvas):
         self.w, self.h, self.color = w, h, color or T["accent"]
 
     def draw(self, vals, ymax=None):
+        if vals == getattr(self, "_last", None):
+            return
+        self._last = list(vals)
         self.delete("all")
         if len(vals) < 2:
             return
@@ -2003,7 +2074,7 @@ class HomePage(Page):
             if "cpu" in k["bars"]:
                 k["bars"]["cpu"][0].set(min(1, c["cpu"] * 4 / 100))
                 k["bars"]["cpu"][1].configure(text=f"{c['cpu']:.1f}%")
-                k["bars"]["ram"][0].set(min(1, c["rss"] / 3e9))
+                k["bars"]["ram"][0].set(min(1, c["rss"] / ((self.core.profile()["ramcap"] << 20) or 3e9)))
                 k["bars"]["ram"][1].configure(text=fmt_mb(c["rss"]))
                 g = c.get("gpu")
                 k["bars"]["gpu"][0].set(min(1, (g or 0) * 4 / 100))
@@ -3061,6 +3132,10 @@ class MonitorPage(Page):
         if not s:
             return
         last, sel = s[-1], self.client.get()
+        key = (last["t"], self.range.get(), sel, self.cpu.winfo_width())
+        if key == getattr(self, "_key", None):
+            return
+        self._key = key
         if sel == "All clients":
             rb_cpu, rb_ram = [x["rb_cpu"] for x in s], [x["rb_ram"] / 1048576 for x in s]
             rb_v, rb_s = f"{last['rb_cpu']:.1f}%  ·  {fmt_mb(last['rb_ram'])}", f"{last['count']} client(s)"
@@ -3097,7 +3172,7 @@ class PerfPage(Page):
                 "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients in efficiency mode."),
                 "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, efficiency mode, {max(1, NCPU // 2)} core(s) each, power-saving GPU."),
                 "minimal": ("Minimal", "10% CPU cap, 320×180, 15 FPS, graphics 1/10, 1 core each, efficiency mode, memory trim. As light as it gets."),
-                "lowest": ("Lowest · 5% / 5%", "5% CPU and 5% GPU max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
+                "lowest": ("Lowest · 5% / 5%", "5% CPU, 5% GPU and 100 MB RAM max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
                 "custom": ("Custom", "Every option below, your values.")}
         for i, k in enumerate(("balanced", "low", "ultra", "minimal", "lowest", "custom")):
             f = card(row)
@@ -3140,6 +3215,9 @@ class PerfPage(Page):
         self.cap = slider_row(a, "Hard CPU cap per client (0 = off)", 0, 100, 100, db.num("p_cap", 0, 100),
                               lambda v: "off" if int(v) == 0 else f"{int(v)}% of total CPU")
         self.cw.append(self.cap)
+        self.ramcap = slider_row(a, "RAM limit per client, MB (0 = off)", 0, 2000, 100, db.num("p_ramcap", 0, 8000),
+                                 lambda v: "off" if int(v) == 0 else f"{int(v)} MB max")
+        self.cw.append(self.ramcap)
         self.iv = slider_row(a, "Monitoring interval", 1, 15, 14, db.num("interval", 1, 30), lambda v: f"{int(v)} s")
         L(b, "GPU and display", 14, True, color=T["accent"]).pack(anchor="w", pady=(4, 6))
         r = ctk.CTkFrame(b, fg_color="transparent")
@@ -3172,7 +3250,7 @@ class PerfPage(Page):
         self.automin.pack(anchor="w", pady=6)
         self.cw.append(self.automin)
         L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, a Windows job-object hard CPU cap, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written to each account's isolated profile (or, without isolation, while no client is running; a backup is kept).\n"
-              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target.",
+              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target. The RAM limit is a hard working-set cap: Windows keeps at most that much of a client in physical memory and moves the rest to the page file, so very low limits make Roblox slow and disk-heavy.",
           11, muted=True, wraplength=900, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x")
@@ -3201,6 +3279,7 @@ class PerfPage(Page):
         db.set("p_cores", int(self.cores.get()))
         db.set("p_cap", int(self.cap.get()))
         db.set("p_gpucap", int(self.gpucap.get()))
+        db.set("p_ramcap", int(self.ramcap.get()))
         db.set("interval", int(self.iv.get()))
         db.set("p_gpu", {"System default": "default", "Power saving": "power", "High performance": "high"}[self.gpu.get()])
         db.set("p_gfx", int(self.gfx.get()))
@@ -3311,6 +3390,7 @@ class SettingsPage(Page):
                    save=lambda v: db.set("ui_iv", int(v)))
         switch(p, "Slow down while in the background, pause while minimized", "ui_pause")
         switch(p, "Run RoManager in Windows efficiency mode while idle", "self_eco")
+        switch(p, "Efficiency mode all the time, not only while idle", "self_eco_always")
         switch(p, "Live window previews (Windows tab)", "prev_on")
         slider_row(p, "Preview refresh interval", 2, 60, 58, db.num("prev_iv", 2, 60), lambda v: f"{int(v)} s",
                    save=lambda v: db.set("prev_iv", int(v)))
@@ -3423,6 +3503,19 @@ class SettingsPage(Page):
 
 
 # ------------------------------------------------------------------- App ---
+class LazyPages(dict):
+    """Builds a tab the first time it is opened, so start-up and idle memory stay small."""
+
+    def __init__(self, app, classes):
+        super().__init__()
+        self.app, self.classes = app, classes
+
+    def __missing__(self, name):
+        page = self.classes[name](self.app.content, self.app)
+        self[name] = page
+        return page
+
+
 class App(ctk.CTk):
     NAV = [("Home", "Dashboard", "⌂"), ("Accounts", "Accounts", "☺"), ("Play", "Play", "▶"), ("Windows", "Windows", "▣"),
            ("MultiView", "Multi-View", "▦"), ("Monitor", "Monitor", "◔"), ("Performance", "Performance", "⚡"), ("Settings", "Settings", "⚙")]
@@ -3438,7 +3531,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build()
         self.show("Home")
-        self.after(200, self.pump)
+        self.after(300, self.pump)
         self.after(1200, self.tick)
         if core.db.flag("multi") and not core.mutex:
             self.after(900, lambda: self.toast(core.multi_status, "warn"))
@@ -3504,13 +3597,15 @@ class App(ctk.CTk):
         self.content.grid_rowconfigure(0, weight=1)
         classes = {"Home": HomePage, "Accounts": AccountsPage, "Play": PlayPage, "Windows": WindowsPage, "MultiView": MultiViewPage,
                    "Monitor": MonitorPage, "Performance": PerfPage, "Settings": SettingsPage}
-        self.pages = {n: c(self.content, self) for n, c in classes.items()}
+        self.pages = LazyPages(self, classes)
 
     def rebuild(self, page):
-        try:
-            self.pages["MultiView"].release_all()  # destroying the frames would close embedded clients
-        except Exception:
-            pass
+        mv = self.pages.get("MultiView")
+        if mv:
+            try:
+                mv.release_all()  # destroying the frames would close embedded clients
+            except Exception:
+                pass
         self.avatars = {k: v for k, v in self.avatars.items() if v is not None}
         self.build()
         self.show(page)
@@ -3568,7 +3663,7 @@ class App(ctk.CTk):
                     self.core.log(f"UI error: {e}")
         except queue.Empty:
             pass
-        self.after(200, self.pump)
+        self.after(1000 if self.state() == "iconic" else 300, self.pump)
 
     def ui(self, fn):
         self.uiq.put(fn)
@@ -3623,7 +3718,10 @@ class App(ctk.CTk):
         try:
             iconic = self.state() == "iconic"
             idle = iconic or (user32.GetForegroundWindow() or 0) != (self.root_hwnd() or 0)
-            self.eco_self(idle)
+            self.eco_self(idle or db.flag("self_eco_always"))
+            if idle and time.time() - getattr(self, "_trim_t", 0) > 120:
+                self._trim_t = time.time()
+                os_trim(os.getpid())  # hand back unused memory while nobody is looking
             while self.core.toastq:
                 m, k = self.core.toastq.pop(0)
                 self.toast(m, k)
@@ -3635,15 +3733,19 @@ class App(ctk.CTk):
                     self.status.configure(text=f" {n} running")
             if idle and db.flag("ui_pause"):
                 delay = max(delay, 4000)
+            if iconic:
+                delay = max(delay, 8000)
         except Exception as e:
             self.core.log(f"UI error: {e}")
         self.after(delay, self.tick)
 
     def on_close(self):
-        try:
-            self.pages["MultiView"].release_all()  # give embedded Roblox windows back before we exit
-        except Exception:
-            pass
+        mv = self.pages.get("MultiView")
+        if mv:
+            try:
+                mv.release_all()  # give embedded Roblox windows back before we exit
+            except Exception:
+                pass
         self.core.shutdown()
         self.destroy()
 
@@ -3695,6 +3797,7 @@ def main():
         psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # the manager never needs to outrun the games
     except psutil.Error:
         pass
+    sys.setswitchinterval(0.05)
     core.start()
     App(core).mainloop()
 
