@@ -512,6 +512,9 @@ def login_window():
                     continue
 
         webview.start(watch, private_mode=True)
+    except ModuleNotFoundError as e:
+        fail(f"This build of RoManager is missing the login component ('{e.name}'). "
+             "Rebuild it with the updated build.yml (it installs pywebview), or use Import cookie meanwhile.")
     except Exception:
         import traceback
         fail(traceback.format_exc())
