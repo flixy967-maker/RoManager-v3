@@ -1,6 +1,12 @@
 """
 RoManager - Roblox multi-account manager and multi-instance launcher (single file).
-Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, pywebview.
+Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, selenium.
+
+The "Log in to add" flow drives a real Microsoft Edge (or Chrome) window with Selenium
+to show the actual roblox.com login page - no pywebview / WebView2-embedding package
+needed. Selenium 4.6+ downloads the matching driver automatically (Selenium Manager),
+so the only extra pip install is "selenium" itself; Edge just needs to already be on
+the machine, which it is on every Windows 10/11 install.
 
 Status: written without a Windows machine to test on. Expect to paste back errors
 from the first runs.
@@ -390,51 +396,94 @@ FILL_JS = """(function(u,p){
 
 
 def login_window():
-    """Runs in a separate process (--login). Shows the real Roblox login page in a private
-    WebView2 window. With --fill, the username/password (read once from stdin, never stored)
-    are typed into the real login form; captcha and 2FA are completed by the user in the window.
-    When login completes the session is printed to stdout (a pipe read by the parent)."""
-    import webview
+    """Runs in a separate process (--login). Opens the REAL roblox.com login page in an
+    actual Microsoft Edge (falling back to Chrome) window, automated with Selenium -
+    no pywebview / embedded-WebView2 package involved, so nothing has to be bundled
+    into the exe for this to work beyond the 'selenium' pip package itself.
+
+    With --fill, the username/password (read once from stdin, never stored) are typed
+    into the real login form via a tiny JS snippet; captcha and 2FA, if shown, are
+    completed by the user in that same window. The window is polled for the
+    .ROBLOSECURITY session cookie (read through Selenium's WebDriver protocol, which -
+    unlike a page-level script - can see httpOnly cookies). As soon as it appears it is
+    printed to stdout (a pipe the parent process reads) and the browser window closes
+    itself automatically."""
+    from selenium import webdriver
+    from selenium.common.exceptions import WebDriverException
+
     creds = None
     if "--fill" in sys.argv:
         try:
             creds = json.loads(sys.stdin.readline())
         except Exception:
             creds = None
-    win = webview.create_window("Log in to Roblox - RoManager", "https://www.roblox.com/login",
-                                width=520, height=780)
-    box = {"creds": creds}
 
-    def fill(*_):
-        c = box["creds"]
-        if not c:
-            return
+    driver = None
+    for browser in ("edge", "chrome"):
         try:
-            if "login" not in (win.get_current_url() or ""):
-                return
-            box["creds"] = None
-            win.evaluate_js(FILL_JS.replace("__U__", json.dumps(c["u"])).replace("__P__", json.dumps(c["p"])))
+            if browser == "edge":
+                from selenium.webdriver.edge.options import Options as _Opts
+                opts = _Opts()
+                opts.add_argument("--inprivate")
+            else:
+                from selenium.webdriver.chrome.options import Options as _Opts
+                opts = _Opts()
+                opts.add_argument("--incognito")
+            opts.add_argument("--window-size=520,800")
+            opts.add_argument("--disable-extensions")
+            opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+            driver = (webdriver.Edge if browser == "edge" else webdriver.Chrome)(options=opts)
+            break
+        except WebDriverException:
+            driver = None
+            continue
+        except Exception:
+            driver = None
+            continue
+    if driver is None:
+        print("Could not open a Microsoft Edge or Chrome window for Roblox login. "
+              "Make sure Edge (built into Windows) or Chrome is installed.", file=sys.stderr, flush=True)
+        return
+
+    try:
+        driver.get("https://www.roblox.com/login")
+    except WebDriverException as e:
+        print(f"Could not open the Roblox login page: {e}", file=sys.stderr, flush=True)
+        try:
+            driver.quit()
         except Exception:
             pass
+        return
 
-    if creds:
-        win.events.loaded += fill
-
-    def watch():
-        while True:
-            time.sleep(1.5)
+    filled = False
+    end = time.time() + 900  # give up after 15 minutes of nobody finishing login
+    try:
+        while time.time() < end:
             try:
-                for jar in win.get_cookies():
-                    if ".ROBLOSECURITY" in jar:
-                        val = jar[".ROBLOSECURITY"].value
-                        if len(val) > 100:
-                            print(val, flush=True)
-                            win.destroy()
-                            return
-            except Exception:
-                continue
-
-    webview.start(watch, private_mode=True)
+                url = driver.current_url
+            except WebDriverException:
+                return  # the user closed the window themselves - nothing to report
+            if creds and not filled and "login" in (url or ""):
+                try:
+                    driver.execute_script(
+                        FILL_JS.replace("__U__", json.dumps(creds["u"])).replace("__P__", json.dumps(creds["p"]))
+                    )
+                    filled = True
+                except Exception:
+                    pass
+            try:
+                for jar in driver.get_cookies():
+                    if jar.get("name") == ".ROBLOSECURITY" and len(jar.get("value", "")) > 100:
+                        print(jar["value"], flush=True)
+                        return
+            except WebDriverException:
+                return
+            time.sleep(1.5)
+    finally:
+        try:
+            driver.quit()  # this is the part that makes the window "disappear" once logged in
+        except Exception:
+            pass
 
 
 def browser_login(user=None, pw=None):
@@ -1275,8 +1324,14 @@ def pill(parent, text, color, bg=None):
 
 
 def E(parent, **kw):
+    # NOTE: height was previously passed both as an explicit keyword below AND
+    # arriving inside **kw from some callers (e.g. PlayPage's destination entry,
+    # which calls E(pad, height=40, ...)). That caused:
+    #   TypeError: CTkEntry() got multiple values for keyword argument 'height'
+    # Fix: only fall back to the default height if the caller didn't supply one.
+    kw.setdefault("height", 34)
     return ctk.CTkEntry(parent, fg_color=T["panel2"], border_color=T["border"], text_color=T["text"],
-                        placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), height=34, font=F(13), **kw)
+                        placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), font=F(13), **kw)
 
 
 def SW(parent, text, **kw):
