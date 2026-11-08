@@ -1453,8 +1453,10 @@ def pill(parent, text, color, bg=None):
 
 
 def E(parent, **kw):
-    return ctk.CTkEntry(parent, fg_color=T["panel2"], border_color=T["border"], text_color=T["text"],
-                        placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), height=34, font=F(13), **kw)
+    o = dict(fg_color=T["panel2"], border_color=T["border"], text_color=T["text"],
+             placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), height=34, font=F(13))
+    o.update(kw)
+    return ctk.CTkEntry(parent, **o)
 
 
 def SW(parent, text, **kw):
@@ -1468,10 +1470,11 @@ def SL(parent, **kw):
 
 
 def OM(parent, values, **kw):
-    return ctk.CTkOptionMenu(parent, values=values, fg_color=T["panel2"], button_color=T["border"],
-                             button_hover_color=blend(T["text"], T["border"], .15), text_color=T["text"],
-                             dropdown_fg_color=T["panel2"], dropdown_text_color=T["text"],
-                             dropdown_hover_color=T["border"], corner_radius=max(R - 4, 4), height=34, font=F(13), **kw)
+    o = dict(fg_color=T["panel2"], button_color=T["border"], button_hover_color=blend(T["text"], T["border"], .15),
+             text_color=T["text"], dropdown_fg_color=T["panel2"], dropdown_text_color=T["text"],
+             dropdown_hover_color=T["border"], corner_radius=max(R - 4, 4), height=34, font=F(13))
+    o.update(kw)
+    return ctk.CTkOptionMenu(parent, values=values, **o)
 
 
 def SEG(parent, values, **kw):
