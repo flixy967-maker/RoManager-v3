@@ -1,12 +1,6 @@
 """
 RoManager - Roblox multi-account manager and multi-instance launcher (single file).
-Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, selenium.
-
-The "Log in to add" flow drives a real Microsoft Edge (or Chrome) window with Selenium
-to show the actual roblox.com login page - no pywebview / WebView2-embedding package
-needed. Selenium 4.6+ downloads the matching driver automatically (Selenium Manager),
-so the only extra pip install is "selenium" itself; Edge just needs to already be on
-the machine, which it is on every Windows 10/11 install.
+Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, pywebview.
 
 Status: written without a Windows machine to test on. Expect to paste back errors
 from the first runs.
@@ -16,7 +10,7 @@ whole-file database encryption (secrets are DPAPI-encrypted per field), adopting
 Roblox clients that were started before RoManager.
 """
 import collections, ctypes, hashlib, hmac, io, json, math, os, queue, random
-import re, secrets, sqlite3, subprocess, sys, threading, time, urllib.error
+import re, secrets, shutil, sqlite3, subprocess, sys, threading, time, urllib.error
 import urllib.parse, urllib.request
 from ctypes import wintypes
 from datetime import datetime
@@ -52,6 +46,10 @@ kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 kernel32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
 psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
 
 # ----------------------------------------------------------------- DPAPI ---
 class DATA_BLOB(ctypes.Structure):
@@ -115,6 +113,8 @@ DEFAULTS = {
     "c_prio": "Normal", "c_w": "0", "c_h": "0", "c_automin": "0",
     "p_eco": "0", "p_cores": "0", "p_bg": "0", "p_trim": "0", "p_mem": "0",
     "p_gpu": "default", "p_gfx": "0", "p_fps": "0",
+    "isolate": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
+    "ui_iv": "2", "ui_pause": "1", "self_eco": "1", "prev_on": "1", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
     "lock_hash": "",
@@ -139,6 +139,7 @@ MIGRATIONS = [
     CREATE TABLE recovery_history(id INTEGER PRIMARY KEY, account_id INTEGER, ts REAL,
         attempt INTEGER, result TEXT);
     COMMIT;""",
+    """BEGIN; ALTER TABLE accounts ADD COLUMN pw_enc BLOB; COMMIT;""",
 ]
 
 
@@ -146,16 +147,56 @@ class DB:
     def __init__(self):
         APPDIR.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.c = sqlite3.connect(APPDIR / "romanager.db", check_same_thread=False)
-        self.c.row_factory = sqlite3.Row
-        self.c.execute("PRAGMA journal_mode=WAL")
-        self.c.execute("PRAGMA foreign_keys=ON")
+        self.c = self._open(APPDIR / "romanager.db")
         ver = self.c.execute("PRAGMA user_version").fetchone()[0]
         for i, sql in enumerate(MIGRATIONS[ver:], start=ver + 1):
             with self.lock:
                 self.c.executescript(sql)
                 self.c.execute(f"PRAGMA user_version={i}")
                 self.c.commit()
+        self._backup()
+
+    def _open(self, path):
+        def connect():
+            c = sqlite3.connect(path, check_same_thread=False)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA foreign_keys=ON")
+            return c
+
+        try:
+            c = connect()
+            if c.execute("PRAGMA quick_check").fetchone()[0] == "ok":
+                return c
+            c.close()
+        except sqlite3.DatabaseError:
+            pass
+        # damaged file: keep it aside and restore the newest automatic backup
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if path.exists():
+            path.rename(path.with_name(f"romanager.corrupt-{stamp}.db"))
+        for ext in ("-wal", "-shm"):
+            Path(str(path) + ext).unlink(missing_ok=True)
+        backups = sorted((APPDIR / "backups").glob("romanager-*.db"))
+        if backups:
+            shutil.copy2(backups[-1], path)
+        return connect()
+
+    def _backup(self):
+        """Accounts are never lost silently: one backup per day, newest 7 kept."""
+        try:
+            bdir = APPDIR / "backups"
+            bdir.mkdir(exist_ok=True)
+            f = bdir / f"romanager-{datetime.now():%Y%m%d}.db"
+            if not f.exists():
+                dst = sqlite3.connect(f)
+                with self.lock:
+                    self.c.backup(dst)
+                dst.close()
+                for old in sorted(bdir.glob("romanager-*.db"))[:-7]:
+                    old.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def q(self, sql, args=()):
         with self.lock:
@@ -395,111 +436,105 @@ FILL_JS = """(function(u,p){
   },500);})(__U__,__P__);"""
 
 
+def _tmpdir():
+    d = APPDIR / "tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _wipe(path):
+    try:
+        if path.exists():
+            path.write_bytes(b"\0" * max(1, path.stat().st_size))
+            path.unlink()
+    except OSError:
+        pass
+
+
 def login_window():
-    """Runs in a separate process (--login). Opens the REAL roblox.com login page in an
-    actual Microsoft Edge (falling back to Chrome) window, automated with Selenium -
-    no pywebview / embedded-WebView2 package involved, so nothing has to be bundled
-    into the exe for this to work beyond the 'selenium' pip package itself.
+    """Runs in a separate process (--login <token>). Opens the real Roblox login page in a private
+    WebView2 window. Credentials (optional) arrive and the session leaves through short-lived
+    DPAPI-encrypted files that are wiped immediately, because a windowed exe has no stdin/stdout."""
+    tok = sys.argv[sys.argv.index("--login") + 1] if len(sys.argv) > sys.argv.index("--login") + 1 else "x"
+    base = _tmpdir() / tok
 
-    With --fill, the username/password (read once from stdin, never stored) are typed
-    into the real login form via a tiny JS snippet; captcha and 2FA, if shown, are
-    completed by the user in that same window. The window is polled for the
-    .ROBLOSECURITY session cookie (read through Selenium's WebDriver protocol, which -
-    unlike a page-level script - can see httpOnly cookies). As soon as it appears it is
-    printed to stdout (a pipe the parent process reads) and the browser window closes
-    itself automatically."""
-    from selenium import webdriver
-    from selenium.common.exceptions import WebDriverException
-
-    creds = None
-    if "--fill" in sys.argv:
-        try:
-            creds = json.loads(sys.stdin.readline())
-        except Exception:
-            creds = None
-
-    driver = None
-    for browser in ("edge", "chrome"):
-        try:
-            if browser == "edge":
-                from selenium.webdriver.edge.options import Options as _Opts
-                opts = _Opts()
-                opts.add_argument("--inprivate")
-            else:
-                from selenium.webdriver.chrome.options import Options as _Opts
-                opts = _Opts()
-                opts.add_argument("--incognito")
-            opts.add_argument("--window-size=520,800")
-            opts.add_argument("--disable-extensions")
-            opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-            driver = (webdriver.Edge if browser == "edge" else webdriver.Chrome)(options=opts)
-            break
-        except WebDriverException:
-            driver = None
-            continue
-        except Exception:
-            driver = None
-            continue
-    if driver is None:
-        print("Could not open a Microsoft Edge or Chrome window for Roblox login. "
-              "Make sure Edge (built into Windows) or Chrome is installed.", file=sys.stderr, flush=True)
-        return
+    def fail(msg):
+        base.with_suffix(".err").write_text(msg, encoding="utf-8")
 
     try:
-        driver.get("https://www.roblox.com/login")
-    except WebDriverException as e:
-        print(f"Could not open the Roblox login page: {e}", file=sys.stderr, flush=True)
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        return
+        import webview
+        creds = None
+        fin = base.with_suffix(".in")
+        if fin.exists():
+            try:
+                creds = json.loads(dpapi_unprotect(fin.read_bytes()).decode())
+            finally:
+                _wipe(fin)
+        win = webview.create_window("Log in to Roblox - RoManager", "https://www.roblox.com/login",
+                                    width=520, height=780)
+        box = {"creds": creds}
 
-    filled = False
-    end = time.time() + 900  # give up after 15 minutes of nobody finishing login
-    try:
-        while time.time() < end:
-            try:
-                url = driver.current_url
-            except WebDriverException:
-                return  # the user closed the window themselves - nothing to report
-            if creds and not filled and "login" in (url or ""):
-                try:
-                    driver.execute_script(
-                        FILL_JS.replace("__U__", json.dumps(creds["u"])).replace("__P__", json.dumps(creds["p"]))
-                    )
-                    filled = True
-                except Exception:
-                    pass
-            try:
-                for jar in driver.get_cookies():
-                    if jar.get("name") == ".ROBLOSECURITY" and len(jar.get("value", "")) > 100:
-                        print(jar["value"], flush=True)
-                        return
-            except WebDriverException:
+        def fill(*_):
+            c = box["creds"]
+            if not c:
                 return
-            time.sleep(1.5)
-    finally:
-        try:
-            driver.quit()  # this is the part that makes the window "disappear" once logged in
-        except Exception:
-            pass
+            try:
+                if "login" not in (win.get_current_url() or "").lower():
+                    return
+                box["creds"] = None
+                win.evaluate_js(FILL_JS.replace("__U__", json.dumps(c["u"])).replace("__P__", json.dumps(c["p"])))
+            except Exception:
+                pass
+
+        if creds:
+            win.events.loaded += fill
+
+        def watch():
+            logged_since = None
+            while True:
+                time.sleep(1.5)
+                try:
+                    for jar in win.get_cookies():
+                        if ".ROBLOSECURITY" in jar:
+                            val = jar[".ROBLOSECURITY"].value
+                            if len(val) > 100:
+                                base.with_suffix(".out").write_bytes(dpapi_protect(val.encode()))
+                                win.destroy()
+                                return
+                    url = win.get_current_url() or ""
+                    if any(x in url for x in ("/home", "/games", "/discover")):
+                        logged_since = logged_since or time.time()
+                        if time.time() - logged_since > 15:
+                            fail("You are logged in, but the login window did not expose the session. Use Import cookie instead.")
+                            win.destroy()
+                            return
+                except Exception:
+                    continue
+
+        webview.start(watch, private_mode=True)
+    except Exception:
+        import traceback
+        fail(traceback.format_exc())
 
 
 def browser_login(user=None, pw=None):
-    base = [sys.executable, "--login"] if getattr(sys, "frozen", False) else \
-        [sys.executable, os.path.abspath(sys.argv[0]), "--login"]
-    payload = ""
-    if user and pw:
-        base.append("--fill")
-        payload = json.dumps({"u": user, "p": pw}) + "\n"
-    p = subprocess.run(base, input=payload, capture_output=True, text=True, timeout=900, creationflags=0x08000000)
-    lines = p.stdout.strip().splitlines()
-    val = lines[-1].strip() if lines else ""
-    if not val:
-        hint = p.stderr.strip()[-200:] if p.returncode not in (0, 1) else ""
+    tok = secrets.token_hex(8)
+    base = _tmpdir() / tok
+    cmd = [sys.executable, "--login", tok] if getattr(sys, "frozen", False) else \
+        [sys.executable, os.path.abspath(sys.argv[0]), "--login", tok]
+    try:
+        if user and pw:
+            base.with_suffix(".in").write_bytes(dpapi_protect(json.dumps({"u": user, "p": pw}).encode()))
+        subprocess.run(cmd, timeout=900, creationflags=0x08000000, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out, err = base.with_suffix(".out"), base.with_suffix(".err")
+        if out.exists():
+            return dpapi_unprotect(out.read_bytes()).decode()
+        hint = err.read_text(encoding="utf-8", errors="ignore")[-700:] if err.exists() else ""
         raise RuntimeError("The login window was closed before login finished." + (f"\n\n{hint}" if hint else ""))
-    return val
+    finally:
+        for ext in (".in", ".out", ".err"):
+            _wipe(base.with_suffix(ext))
 
 
 # --------------------------------------------------------------- windows ---
@@ -595,13 +630,19 @@ PRIO = {"Normal": psutil.NORMAL_PRIORITY_CLASS, "Below normal": psutil.BELOW_NOR
         "Idle": psutil.IDLE_PRIORITY_CLASS}
 
 PRESET_DEFS = {
-    "balanced": dict(prio="Normal", size=None, automin=False, eco=False, cores=0, bgthrottle=False,
-                     trim=False, memprio=False, gpu="default", gfx=0, fps=0, interval=None),
+    "balanced": dict(prio="Normal", size=None, automin=False, eco=False, cores=0, bgthrottle=False, trim=False,
+                     memprio=False, gpu="default", gfx=0, fps=0, cpucap=0, interval=None),
     "low": dict(prio="Below normal", size=(640, 360), automin=False, eco=False, cores=0, bgthrottle=True,
-                trim=True, memprio=True, gpu="power", gfx=3, fps=30, interval=5),
+                trim=True, memprio=True, gpu="power", gfx=3, fps=30, cpucap=50, interval=5),
     "ultra": dict(prio="Below normal", size=(480, 270), automin=False, eco=True, cores=max(1, NCPU // 2),
-                  bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=20, interval=5),
+                  bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=20, cpucap=25, interval=5),
+    "minimal": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
+                    bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=15, cpucap=10, interval=5),
 }
+
+
+class JOB_CPU_RATE(ctypes.Structure):
+    _fields_ = [("ControlFlags", wintypes.DWORD), ("CpuRate", wintypes.DWORD)]
 
 
 def _handle(pid, access):
@@ -639,6 +680,32 @@ def os_trim(pid):
         return bool(psapi.EmptyWorkingSet(h))
     finally:
         kernel32.CloseHandle(h)
+
+
+def os_set_cap(c, pct):
+    """Hard CPU cap through a Windows job object (documented JobObjectCpuRateControlInformation).
+    pct is a percent of TOTAL CPU for that one client; 0 removes the cap."""
+    if pct <= 0:
+        if c.get("job"):
+            info = JOB_CPU_RATE(0, 0)
+            kernel32.SetInformationJobObject(c["job"], 15, ctypes.byref(info), ctypes.sizeof(info))
+        return True
+    if not c.get("job"):
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return False
+        ph = _handle(c["pid"], 0x0100 | 0x0001)
+        if not ph:
+            kernel32.CloseHandle(job)
+            return False
+        ok = kernel32.AssignProcessToJobObject(job, ph)
+        kernel32.CloseHandle(ph)
+        if not ok:
+            kernel32.CloseHandle(job)
+            return False
+        c["job"] = job
+    info = JOB_CPU_RATE(0x1 | 0x4, int(pct * 100))  # ENABLE | HARD_CAP, rate in 1/100 percent
+    return bool(kernel32.SetInformationJobObject(c["job"], 15, ctypes.byref(info), ctypes.sizeof(info)))
 
 
 def roblox_exes():
@@ -718,15 +785,19 @@ class Core:
             return "Multi-instance off."
         if self.mutex:
             return "Multi-instance already on."
-        h = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")
-        err = ctypes.get_last_error() or kernel32.GetLastError()
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateMutexW.restype = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        h = k.CreateMutexW(None, True, "ROBLOX_singletonMutex")
+        err = ctypes.get_last_error()
         if not h:
             return "Could not create the instance mutex."
-        if err == 183:  # already exists -> someone else (Roblox) owns it
+        if err == 183:  # Roblox already owns it
             kernel32.CloseHandle(ctypes.c_void_p(h))
-            return "Roblox is already running and owns the mutex. Close all Roblox windows, then enable multi-instance."
+            return ("Roblox is already running and owns the instance mutex. Close every Roblox window; "
+                    "RoManager retries before each launch queue.")
         self.mutex = h
-        return "Multi-instance on (mutex held). Depends on your Roblox version; verify with 2 accounts."
+        return "Multi-instance on."
 
     # -- launching
     def launch_one(self, aid, dest):
@@ -746,7 +817,11 @@ class Core:
         finally:
             cookie = None
         before = roblox_pids()
-        os.startfile(build_uri(ticket, dest))
+        uri = build_uri(ticket, dest)
+        if self.db.flag("isolate"):
+            self.launch_isolated(acc, uri)
+        else:
+            os.startfile(uri)
         pid, end = None, time.time() + 60
         while pid is None and time.time() < end and not self.stop:
             time.sleep(1)
@@ -779,6 +854,34 @@ class Core:
             if not code:
                 self.log("Could not read the private server access code; trying the link code alone.", "warn")
 
+    def prepare_sandbox(self, key):
+        """Each account gets its own Roblox data folder so clients stop sharing (and fighting over) local session data."""
+        local = APPDIR / "sandbox" / str(key) / "Local"
+        rb = local / "Roblox"
+        rb.mkdir(parents=True, exist_ok=True)
+        dst = rb / "GlobalBasicSettings_13.xml"
+        src = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "GlobalBasicSettings_13.xml"
+        if not dst.exists() and src.exists():
+            shutil.copy2(src, dst)
+        pr = self.profile()
+        if (pr["gfx"] or pr["fps"]) and dst.exists():
+            try:
+                self.edit_roblox_settings(pr["gfx"], pr["fps"], dst)
+            except Exception as e:
+                self.log(f"Sandbox graphics settings not changed: {e}")
+        return local
+
+    def launch_isolated(self, acc, uri):
+        exes = roblox_exes()
+        if not exes:
+            raise RuntimeError("RobloxPlayerBeta.exe was not found. Install Roblox first.")
+        exe = max(exes, key=lambda p: p.stat().st_mtime)
+        local = self.prepare_sandbox(acc["user_id"] or acc["id"])
+        env = os.environ.copy()
+        env["LOCALAPPDATA"] = str(local)
+        subprocess.Popen([str(exe), uri], env=env, cwd=str(exe.parent), close_fds=True,
+                         creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+
     def start_queue(self, ids, dest, delay):
         if self.qs["running"]:
             raise RuntimeError("A launch queue is already running.")
@@ -788,6 +891,8 @@ class Core:
         threading.Thread(target=self._queue, args=(list(ids), dest, delay), daemon=True).start()
 
     def _queue(self, ids, dest, delay):
+        if self.db.flag("multi") and not self.mutex:
+            self.log(self.set_multi(True))
         self.apply_global_perf()
         for i, aid in enumerate(ids):
             self.pause_ev.wait()
@@ -934,7 +1039,8 @@ class Core:
                      automin=self.db.flag("c_automin"), eco=self.db.flag("p_eco"),
                      cores=self.db.num("p_cores", 0, NCPU), bgthrottle=self.db.flag("p_bg"),
                      trim=self.db.flag("p_trim"), memprio=self.db.flag("p_mem"), gpu=self.db.get("p_gpu"),
-                     gfx=self.db.num("p_gfx", 0, 10), fps=self.db.num("p_fps", 0, 240), interval=None)
+                     gfx=self.db.num("p_gfx", 0, 10), fps=self.db.num("p_fps", 0, 240),
+                     cpucap=self.db.num("p_cap", 0, 100), interval=None)
         d["prio_class"] = PRIO.get(d["prio"], psutil.NORMAL_PRIORITY_CLASS)
         d["interval"] = max(d["interval"], iv) if d["interval"] else iv
         return d
@@ -952,7 +1058,7 @@ class Core:
         eco = bool(pr["eco"] or (bg and pr["bgthrottle"]))
         now = time.time()
         do_trim = bg and pr["trim"] and now - c["last_trim"] > 60
-        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]))
+        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), pr["cpucap"])
         if c["tuned"] == state and not do_trim:
             return
         pid = c["pid"]
@@ -971,6 +1077,11 @@ class Core:
                     c["mem_set"] = pr["memprio"]
                 elif pr["memprio"]:
                     self._deny(c, "low memory priority")
+            if pr["cpucap"] or c.get("cap_set"):
+                if os_set_cap(c, pr["cpucap"]):
+                    c["cap_set"] = pr["cpucap"] > 0
+                elif pr["cpucap"]:
+                    self._deny(c, "CPU usage cap")
             if pr["cores"] > 0 or c.get("aff_set"):
                 n = pr["cores"] or NCPU
                 cores = sorted({(idx * n + k) % NCPU for k in range(n)})
@@ -1031,7 +1142,7 @@ class Core:
             notes.append(self.set_gpu_pref(pr["gpu"]))
         except Exception as e:
             notes.append(f"GPU preference not changed: {e}")
-        if pr["gfx"] or pr["fps"]:
+        if (pr["gfx"] or pr["fps"]) and not self.db.flag("isolate"):
             if roblox_pids():
                 notes.append("Roblox is running, so graphics quality / FPS cap were not changed "
                              "(Roblox rewrites its settings file on exit). Close all clients and launch again.")
@@ -1063,14 +1174,16 @@ class Core:
         return (f"Windows GPU preference set to {label} for Roblox (applies to clients started afterwards; "
                 "only matters on PCs with more than one GPU).")
 
-    def edit_roblox_settings(self, gfx, fps):
-        path = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "GlobalBasicSettings_13.xml"
+    def edit_roblox_settings(self, gfx, fps, path=None):
+        real = path is None
+        path = path or Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "GlobalBasicSettings_13.xml"
         if not path.exists():
             return "Roblox settings file not found yet. Start Roblox once, close it, then apply again."
         txt = path.read_text(encoding="utf-8", errors="ignore")
-        bak = path.with_name(path.name + ".romanager.bak")
-        if not bak.exists():
-            bak.write_text(txt, encoding="utf-8")
+        if real:
+            bak = path.with_name(path.name + ".romanager.bak")
+            if not bak.exists():
+                bak.write_text(txt, encoding="utf-8")
         done = []
 
         def sub(pattern, val, label):
@@ -1271,6 +1384,22 @@ def release_window(hwnd, saved):
     user32.SetWindowPos(hwnd, V(0), int(x), int(y), int(w), int(h), 0x0004 | 0x0020 | 0x0040)
 
 
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+user32.WindowFromPoint.restype = V
+user32.WindowFromPoint.argtypes = [POINT]
+user32.GetCursorPos.argtypes = [V]
+user32.SetFocus.restype = V
+user32.SetFocus.argtypes = [V]
+user32.GetFocus.restype = V
+user32.IsChild.argtypes = [V, V]
+user32.GetAncestor.restype = V
+user32.GetAncestor.argtypes = [V, wintypes.UINT]
+user32.GetForegroundWindow.restype = V
+
+
 def hexrgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
@@ -1324,14 +1453,8 @@ def pill(parent, text, color, bg=None):
 
 
 def E(parent, **kw):
-    # NOTE: height was previously passed both as an explicit keyword below AND
-    # arriving inside **kw from some callers (e.g. PlayPage's destination entry,
-    # which calls E(pad, height=40, ...)). That caused:
-    #   TypeError: CTkEntry() got multiple values for keyword argument 'height'
-    # Fix: only fall back to the default height if the caller didn't supply one.
-    kw.setdefault("height", 34)
     return ctk.CTkEntry(parent, fg_color=T["panel2"], border_color=T["border"], text_color=T["text"],
-                        placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), font=F(13), **kw)
+                        placeholder_text_color=T["muted"], corner_radius=max(R - 4, 4), height=34, font=F(13), **kw)
 
 
 def SW(parent, text, **kw):
@@ -1363,7 +1486,7 @@ def TB(parent, **kw):
                           border_width=1, corner_radius=max(R - 4, 4), font=F(12), **kw)
 
 
-def slider_row(parent, text, frm, to, steps, value, fmt):
+def slider_row(parent, text, frm, to, steps, value, fmt, save=None):
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(fill="x", pady=4)
     top = ctk.CTkFrame(row, fg_color="transparent")
@@ -1374,7 +1497,7 @@ def slider_row(parent, text, frm, to, steps, value, fmt):
     s = SL(row, from_=frm, to=to, number_of_steps=steps)
     s.set(value)
     s.pack(fill="x", pady=(2, 0))
-    s.configure(command=lambda v: val.configure(text=fmt(v)))
+    s.configure(command=lambda v: (val.configure(text=fmt(v)), save and save(v)))
     return s
 
 
@@ -1740,7 +1863,7 @@ class AccountsPage(Page):
         self.sort.pack(side="left", padx=3)
         self.gfilter = OM(bar, ["All groups"], width=140, command=lambda v: self.rebuild())
         self.gfilter.pack(side="left", padx=3)
-        for t, f, k in [("Remove", self.remove, "danger"), ("Check status", self.check, "ghost"), ("Clear", self.clear_sel, "ghost"),
+        for t, f, k in [("Remove", self.remove, "danger"), ("Re-login", self.relogin, "ghost"), ("Check status", self.check, "ghost"), ("Clear", self.clear_sel, "ghost"),
                         ("Select all", self.select_all, "ghost"), ("New group", self.new_group, "ghost"),
                         ("Set MAIN", self.set_main, "ghost"), ("Edit", self.edit, "ghost")]:
             btn(bar, t, f, k, h=34).pack(side="right", padx=3)
@@ -1860,7 +1983,7 @@ class AccountsPage(Page):
 
     # --- add: username + password (typed into the real Roblox login page) / browser login
     def add_login(self):
-        top = dialog(self.app, "Log in to add", 480, 430)
+        top = dialog(self.app, "Log in to add", 480, 500)
         L(top, "Log in to Roblox", 20, True).pack(anchor="w", padx=24, pady=(22, 2))
         L(top, "Works like Chrome: a real roblox.com login window opens (captcha and 2FA included).\n"
                "Your password is typed into that page once and is never saved by RoManager.",
@@ -1869,6 +1992,10 @@ class AccountsPage(Page):
         u.pack(padx=24, pady=(16, 6))
         p = E(top, width=420, placeholder_text="Password", show="•")
         p.pack(padx=24, pady=6)
+        keep = ctk.CTkCheckBox(top, text="Remember the password (DPAPI-encrypted) for one-click re-login",
+                               text_color=T["text"], fg_color=T["accent"], hover_color=T["accent"],
+                               border_color=T["border"], font=F(12))
+        keep.pack(anchor="w", padx=24, pady=4)
         status = L(top, "", 12, color=BAD)
         status.pack(padx=24)
 
@@ -1876,11 +2003,11 @@ class AccountsPage(Page):
             if not u.get().strip() or not p.get():
                 status.configure(text="Enter the username and password, or use the other button.")
                 return
-            user, pw = u.get().strip(), p.get()
+            user, pw, remember = u.get().strip(), p.get(), bool(keep.get())
             p.delete(0, "end")
             top.destroy()
             self.app.toast("Login window opening… finish any captcha / 2FA there", "info")
-            self.app.bg(lambda: browser_login(user, pw), self._after_login)
+            self.app.bg(lambda: browser_login(user, pw), lambda r, e: self._after_login(r, e, pw if remember else None))
 
         def go_browser():
             top.destroy()
@@ -1891,7 +2018,7 @@ class AccountsPage(Page):
         btn(top, "Open the Roblox login page and type it there", go_browser, "ghost", w=420, h=36).pack(padx=24)
         L(top, "Or use “Import cookie” / “Bulk import” for .ROBLOSECURITY cookies.", 11, muted=True).pack(pady=12)
 
-    def _after_login(self, cookie, err):
+    def _after_login(self, cookie, err, pw=None):
         if err:
             messagebox.showerror(APP_NAME, str(err))
             return
@@ -1906,8 +2033,41 @@ class AccountsPage(Page):
                 return
             me, rb = res
             r = self.store(cookie, me, rb)
+            if pw:
+                self.core.db.q("UPDATE accounts SET pw_enc=? WHERE user_id=?", (dpapi_protect(pw.encode()), me["id"]))
             self.rebuild()
             self.app.toast(f"{r.capitalize()} {me['name']}", "ok")
+
+        self.app.bg(work, done)
+
+    def relogin(self):
+        ids = self.sel_ids()
+        if not ids:
+            messagebox.showinfo(APP_NAME, "Select the accounts to sign in again (their stored sessions stay until replaced).")
+            return
+
+        def work():
+            out = []
+            for i in ids:
+                a = self.core.db.one("SELECT user_id, username, pw_enc FROM accounts WHERE id=?", (i,))
+                if not a:
+                    continue
+                try:
+                    pw = dpapi_unprotect(a["pw_enc"]).decode() if a["pw_enc"] else None
+                    cookie = browser_login(a["username"], pw) if pw else browser_login()
+                    me = whoami(cookie)
+                    if a["user_id"] and me["id"] != a["user_id"]:
+                        out.append(f"{a['username']}: you logged into a different account, skipped")
+                        continue
+                    self.store(cookie, me, get_robux(cookie, me["id"]))
+                    out.append(f"{a['username']}: signed in again")
+                except Exception as e:
+                    out.append(f"{a['username']}: {str(e).splitlines()[0]}")
+            return out
+
+        def done(res, err):
+            self.rebuild()
+            self.app.toast("\n".join(res) if res else str(err), "ok" if res else "bad")
 
         self.app.bg(work, done)
 
@@ -2104,6 +2264,13 @@ class PlayPage(Page):
         self.multi.pack(side="right")
         if self.core.mutex:
             self.multi.select()
+        r2 = ctk.CTkFrame(pad, fg_color="transparent")
+        r2.pack(fill="x", pady=(6, 0))
+        self.iso = SW(r2, "Isolated sessions (recommended when running several accounts)",
+                      command=lambda: self.core.db.set("isolate", "1" if self.iso.get() else "0"))
+        if self.core.db.flag("isolate"):
+            self.iso.select()
+        self.iso.pack(side="left")
         d0 = max(0, min(120, int(float(self.core.db.get("delay") or 8))))
         self.delay = slider_row(pad, "Delay between launches", 0, 120, 120, d0, lambda v: f"{int(v)} s")
         self.sel = L(pad, "", 12, muted=True, justify="left", wraplength=520)
@@ -2345,6 +2512,15 @@ class WindowsPage(Page):
             messagebox.showerror(APP_NAME, "X and Y can be any whole numbers. W and H must be positive whole numbers.")
             return
         win_place(c["hwnd"], int(v[0]), int(v[1]), int(v[2]), int(v[3]))
+        hw, want = c["hwnd"], (int(v[2]), int(v[3]))
+
+        def check():
+            _, _, w_, h_ = win_rect(hw)
+            if w_ > want[0] + 2 or h_ > want[1] + 2:
+                self.app.toast(f"Windows kept it at {w_}×{h_} (the minimum for a normal window). "
+                               "Use the Multi-View tab to go smaller.", "warn")
+
+        self.after(250, check)
 
     def pin(self, pid):
         c = next((c for c in self.core.snapshot() if c["pid"] == pid), None)
@@ -2398,7 +2574,8 @@ class WindowsPage(Page):
             elif c["hwnd"]:
                 x, y, w, h = win_rect(c["hwnd"])
                 t["info"].configure(text=f"PID {c['pid']}   ·   {w}×{h} at ({x}, {y})")
-                if (c["pid"] not in self.capturing and time.time() - self.last_cap.get(c["pid"], 0) > 2.5
+                if (c["pid"] not in self.capturing and self.core.db.flag("prev_on")
+                        and time.time() - self.last_cap.get(c["pid"], 0) > self.core.db.num("prev_iv", 2, 60)
                         and state in ("Normal", "Maximized")):
                     self.capturing.add(c["pid"])
                     self.app.bg(lambda hw=c["hwnd"]: capture(hw), lambda img, err, p=c["pid"]: self._got(p, img))
@@ -2411,58 +2588,81 @@ class MultiViewPage(Page):
     PRESETS = [("Tiny", 160, 90), ("Small", 320, 180), ("Medium", 480, 270), ("Large", 640, 360)]
 
     def __init__(self, parent, app):
-        super().__init__(parent, app, "Multi-View", "Every Roblox client live inside RoManager, at any size you choose")
+        super().__init__(parent, app, "Multi-View", "Every Roblox client inside RoManager. Hover a window and play it normally.")
+        db = self.core.db
         self.tiles, self.cols, self.order, self.active = {}, 0, None, False
-        self.tw, self.th = 320, 180
+        self.tw, self.th = db.num("mv_w", 1, 4000), db.num("mv_h", 1, 4000)
+        self.pw, self.ph = db.num("mv_pw", 1, 4000), db.num("mv_ph", 1, 4000)
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x", pady=(0, PAD))
         g = card(bar)
         g.pack(side="left", padx=(0, 8))
         i1 = ctk.CTkFrame(g, fg_color="transparent")
         i1.pack(padx=10, pady=8)
-        L(i1, "Tile size", 12, True).pack(side="left", padx=(0, 8))
-        self.ew, self.eh = E(i1, width=70), E(i1, width=70)
-        self.ew.insert(0, str(self.tw))
-        self.eh.insert(0, str(self.th))
+        L(i1, "Tile", 12, True).pack(side="left", padx=(0, 6))
+        self.ew = E(i1, width=64)
         self.ew.pack(side="left", padx=2)
         L(i1, "×", 13, muted=True).pack(side="left")
+        self.eh = E(i1, width=64)
         self.eh.pack(side="left", padx=2)
+        L(i1, "Play size", 12, True).pack(side="left", padx=(14, 6))
+        self.ep = E(i1, width=64)
+        self.ep.pack(side="left", padx=2)
+        L(i1, "×", 13, muted=True).pack(side="left")
+        self.eq = E(i1, width=64)
+        self.eq.pack(side="left", padx=2)
+        for e, v in ((self.ew, self.tw), (self.eh, self.th), (self.ep, self.pw), (self.eq, self.ph)):
+            e.insert(0, str(v))
         btn(i1, "Apply", self.apply_size, "accent", w=64, h=34).pack(side="left", padx=(8, 0))
         g2 = card(bar)
         g2.pack(side="left", padx=(0, 8))
         i2 = ctk.CTkFrame(g2, fg_color="transparent")
         i2.pack(padx=6, pady=6)
         for name, w, h in self.PRESETS:
-            btn(i2, f"{name} {w}×{h}", lambda w=w, h=h: self.set_size(w, h), "flat", h=32).pack(side="left", padx=2)
+            btn(i2, f"{name} {w}×{h}", lambda w=w, h=h: self.set_sizes(w, h, self.pw, self.ph), "flat", h=32).pack(side="left", padx=2)
         btn(bar, "Release all", self.release_btn, "ghost", w=110, h=36).pack(side="right", padx=4)
         btn(bar, "Embed all", self.embed_btn, "ghost", w=110, h=36).pack(side="right", padx=4)
-        L(self, "Windows are placed inside this tab with the Windows SetParent call, so they can be any size (even 1×1). "
-                "Pop a window out any time. Closing RoManager releases them first. If RoManager is force-killed while windows are "
-                "embedded, they close with it. Not every Roblox build allows being embedded; if Windows refuses, the tile says so.",
+        L(self, "Tiles can be any size (even 1×1). Move the mouse over a window and use it normally: RoManager hands it the keyboard. "
+                "“Play” enlarges one client to the play size. Closing RoManager releases the windows first; a force-kill closes them. "
+                "If a game behaves oddly inside a tile, pop it out.",
           11, muted=True, wraplength=1000, justify="left").pack(anchor="w", pady=(0, PAD))
         self.host = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.host.pack(fill="both", expand=True)
         self.empty = L(self.host, "No Roblox windows yet. Launch an account and it appears here.", 14, muted=True)
+        self.after(500, self.follow)
 
-    # -- sizing
+    def tile_size(self, t):
+        return (self.pw, self.ph) if t["big"] else (self.tw, self.th)
+
     def apply_size(self):
-        wh = parse_wh(f"{self.ew.get()}x{self.eh.get()}")
-        if not wh or wh[0] > 4000 or wh[1] > 4000:
-            messagebox.showerror(APP_NAME, "Enter a width and height between 1 and 4000.")
+        a = parse_wh(f"{self.ew.get()}x{self.eh.get()}")
+        b = parse_wh(f"{self.ep.get()}x{self.eq.get()}")
+        if not a or not b or max(a + b) > 4000:
+            messagebox.showerror(APP_NAME, "Enter widths and heights between 1 and 4000.")
             return
-        self.set_size(*wh)
+        self.set_sizes(*a, *b)
 
-    def set_size(self, w, h):
-        self.tw, self.th = w, h
-        self.ew.delete(0, "end")
-        self.ew.insert(0, str(w))
-        self.eh.delete(0, "end")
-        self.eh.insert(0, str(h))
-        for pid, t in self.tiles.items():
-            t["view"].configure(width=w, height=h)
-            c = self.client(pid)
-            if c and c.get("embedded") and c["hwnd"]:
-                win_place(c["hwnd"], 0, 0, w, h)
+    def set_sizes(self, tw, th, pw, ph):
+        self.tw, self.th, self.pw, self.ph = tw, th, pw, ph
+        db = self.core.db
+        db.set("mv_w", tw)
+        db.set("mv_h", th)
+        db.set("mv_pw", pw)
+        db.set("mv_ph", ph)
+        for e, v in ((self.ew, tw), (self.eh, th), (self.ep, pw), (self.eq, ph)):
+            e.delete(0, "end")
+            e.insert(0, str(v))
+        for pid in self.tiles:
+            self.resize_tile(pid)
+
+    def resize_tile(self, pid):
+        t, c = self.tiles.get(pid), self.client(pid)
+        if not t:
+            return
+        w, h = self.tile_size(t)
+        t["view"].configure(width=w, height=h)
+        if c and c.get("embedded") and c["hwnd"]:
+            win_place(c["hwnd"], 0, 0, w, h)
         self.order = None
 
     def client(self, pid):
@@ -2472,7 +2672,8 @@ class MultiViewPage(Page):
     def embed_one(self, c, t):
         try:
             t["view"].update_idletasks()
-            t["saved"] = embed_window(c["hwnd"], t["view"].winfo_id(), self.tw, self.th)
+            w, h = self.tile_size(t)
+            t["saved"] = embed_window(c["hwnd"], t["view"].winfo_id(), w, h)
             c["embedded"], t["popped"] = True, False
             t["pop"].configure(text="Pop out")
         except Exception as e:
@@ -2518,6 +2719,16 @@ class MultiViewPage(Page):
             t["popped"], t["failed"] = False, False
             t["pop"].configure(text="Pop out")
 
+    def toggle_big(self, pid):
+        t, c = self.tiles.get(pid), self.client(pid)
+        if not t:
+            return
+        t["big"] = not t["big"]
+        t["play"].configure(text="Shrink" if t["big"] else "Play ⤢")
+        self.resize_tile(pid)
+        if c and c.get("embedded") and c["hwnd"]:
+            user32.SetFocus(c["hwnd"])
+
     def on_enter(self):
         self.active = True
         for c in self.core.snapshot():
@@ -2529,6 +2740,26 @@ class MultiViewPage(Page):
         for c in self.core.snapshot():
             if c.get("embedded") and c["hwnd"]:
                 user32.ShowWindow(c["hwnd"], 0)
+
+    def follow(self):
+        """Keyboard focus follows the mouse into the embedded client under the cursor."""
+        try:
+            if self.active and (user32.GetForegroundWindow() or 0) == (user32.GetAncestor(self.winfo_id(), 2) or 0):
+                emb = [c for c in self.core.snapshot() if c.get("embedded") and c["hwnd"]]
+                if emb:
+                    pt = POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    under = user32.WindowFromPoint(pt)
+                    if under:
+                        for c in emb:
+                            h = c["hwnd"]
+                            if under == h or user32.IsChild(h, under):
+                                if (user32.GetFocus() or 0) != h:
+                                    user32.SetFocus(h)
+                                break
+        except Exception:
+            pass
+        self.after(120, self.follow)
 
     # -- tiles
     def make_tile(self, c):
@@ -2545,13 +2776,15 @@ class MultiViewPage(Page):
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(0, 8))
         pid = c["pid"]
-        pop = btn(row, "Pop out", lambda: self.toggle_pop(pid), "ghost", h=28, w=80)
-        pop.pack(side="left")
-        btn(row, "Close client", lambda: self.core.close_client(pid), "danger", h=28, w=96).pack(side="left", padx=6)
+        play = btn(row, "Play ⤢", lambda: self.toggle_big(pid), "accent", h=28, w=70)
+        play.pack(side="left")
+        pop = btn(row, "Pop out", lambda: self.toggle_pop(pid), "ghost", h=28, w=76)
+        pop.pack(side="left", padx=6)
+        btn(row, "Close", lambda: self.core.close_client(pid), "danger", h=28, w=60).pack(side="left")
         info = L(row, "", 11, muted=True)
         info.pack(side="right")
-        self.tiles[pid] = {"frame": f, "view": view, "pill": pl, "pop": pop, "info": info,
-                           "saved": None, "popped": False, "failed": False}
+        self.tiles[pid] = {"frame": f, "view": view, "pill": pl, "pop": pop, "play": play, "info": info,
+                           "saved": None, "popped": False, "failed": False, "big": False}
 
     def refresh(self):
         cl = sorted(self.core.snapshot(), key=lambda c: c["start"])
@@ -2562,7 +2795,8 @@ class MultiViewPage(Page):
         for c in cl:
             if c["pid"] not in self.tiles:
                 self.make_tile(c)
-        cols = max(1, self.host.winfo_width() // (self.tw + 40))
+        widest = max([self.tile_size(t)[0] for t in self.tiles.values()] or [self.tw])
+        cols = max(1, self.host.winfo_width() // (widest + 40))
         order = [c["pid"] for c in cl]
         if cols != self.cols or order != self.order:
             self.cols, self.order = cols, order
@@ -2587,7 +2821,8 @@ class MultiViewPage(Page):
             else:
                 txt, col = "Waiting", T["muted"]
             t["pill"].configure(text=f" {txt} ", text_color=col, fg_color=blend(col, T["panel"], .16))
-            t["info"].configure(text=f"PID {c['pid']}  ·  {self.tw}×{self.th}")
+            w, h = self.tile_size(t)
+            t["info"].configure(text=f"{w}×{h}")
 
 
 # --------------------------------------------------------------- Monitor ---
@@ -2661,20 +2896,21 @@ class PerfPage(Page):
     def __init__(self, parent, app):
         super().__init__(parent, app, "Performance", "Make every Roblox client use less CPU and GPU")
         db = self.core.db
-        self.sel = db.get("preset") if db.get("preset") in ("balanced", "low", "ultra") else "custom"
+        self.sel = db.get("preset") if db.get("preset") in ("balanced", "low", "ultra", "minimal") else "custom"
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
-        row.grid_columnconfigure(tuple(range(4)), weight=1, uniform="pp")
+        row.grid_columnconfigure(tuple(range(5)), weight=1, uniform="pp")
         self.pcards = {}
         info = {"balanced": ("Balanced", "Windows defaults. Nothing is throttled."),
-                "low": ("Low resource", "Below-normal priority, 640×360 windows, 30 FPS cap, graphics 3/10, efficiency mode and memory trim for background clients."),
-                "ultra": ("Ultra low", f"480×270 windows, 20 FPS cap, graphics 1/10, efficiency mode on every client, each limited to {max(1, NCPU // 2)} CPU core(s), power-saving GPU."),
+                "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients in efficiency mode."),
+                "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, efficiency mode, {max(1, NCPU // 2)} core(s) each, power-saving GPU."),
+                "minimal": ("Minimal", "10% CPU cap, 320×180, 15 FPS, graphics 1/10, 1 core each, efficiency mode, memory trim. As light as it gets."),
                 "custom": ("Custom", "Every option below, your values.")}
-        for i, k in enumerate(("balanced", "low", "ultra", "custom")):
+        for i, k in enumerate(("balanced", "low", "ultra", "minimal", "custom")):
             f = card(row)
             f.grid(row=0, column=i, sticky="nsew", padx=4)
             L(f, info[k][0], 15, True).pack(anchor="w", padx=14, pady=(12, 2))
-            L(f, info[k][1], 11, muted=True, wraplength=210, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
+            L(f, info[k][1], 11, muted=True, wraplength=170, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
             for w in [f] + list(f.winfo_children()):
                 w.bind("<Button-1>", lambda e, k=k: self.choose(k))
             self.pcards[k] = f
@@ -2708,6 +2944,9 @@ class PerfPage(Page):
         self.cores = slider_row(a, "Limit each client to N CPU cores (0 = all)", 0, NCPU, NCPU, db.num("p_cores", 0, NCPU),
                                 lambda v: "all cores" if int(v) == 0 else f"{int(v)} of {NCPU}")
         self.cw.append(self.cores)
+        self.cap = slider_row(a, "Hard CPU cap per client (0 = off)", 0, 100, 100, db.num("p_cap", 0, 100),
+                              lambda v: "off" if int(v) == 0 else f"{int(v)}% of total CPU")
+        self.cw.append(self.cap)
         self.iv = slider_row(a, "Monitoring interval", 1, 15, 14, db.num("interval", 1, 30), lambda v: f"{int(v)} s")
         L(b, "GPU and display", 14, True, color=T["accent"]).pack(anchor="w", pady=(4, 6))
         r = ctk.CTkFrame(b, fg_color="transparent")
@@ -2737,7 +2976,7 @@ class PerfPage(Page):
             self.automin.select()
         self.automin.pack(anchor="w", pady=6)
         self.cw.append(self.automin)
-        L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written while no client is running (a backup is kept).\n"
+        L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, a Windows job-object hard CPU cap, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written to each account's isolated profile (or, without isolation, while no client is running; a backup is kept).\n"
               "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Smaller windows and lower quality cut GPU load the most.",
           11, muted=True, wraplength=900, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -2765,6 +3004,7 @@ class PerfPage(Page):
         for sw, key in ((self.eco, "p_eco"), (self.bg_, "p_bg"), (self.trim, "p_trim"), (self.mem, "p_mem")):
             db.set(key, "1" if sw.get() else "0")
         db.set("p_cores", int(self.cores.get()))
+        db.set("p_cap", int(self.cap.get()))
         db.set("interval", int(self.iv.get()))
         db.set("p_gpu", {"System default": "default", "Power saving": "power", "High performance": "high"}[self.gpu.get()])
         db.set("p_gfx", int(self.gfx.get()))
@@ -2870,6 +3110,14 @@ class SettingsPage(Page):
             self.sw[key] = s
         btn(p, "Apply appearance", self.apply_appearance, "accent", w=180, h=38).pack(anchor="w", pady=(10, 0))
 
+        p = section("RoManager's own CPU / GPU use", "RoManager is light already. These make it lighter still.")
+        slider_row(p, "UI refresh interval", 1, 10, 9, db.num("ui_iv", 1, 10), lambda v: f"{int(v)} s",
+                   save=lambda v: db.set("ui_iv", int(v)))
+        switch(p, "Slow down while in the background, pause while minimized", "ui_pause")
+        switch(p, "Run RoManager in Windows efficiency mode while idle", "self_eco")
+        switch(p, "Live window previews (Windows tab)", "prev_on")
+        slider_row(p, "Preview refresh interval", 2, 60, 58, db.num("prev_iv", 2, 60), lambda v: f"{int(v)} s",
+                   save=lambda v: db.set("prev_iv", int(v)))
         p = section("General")
         switch(p, "Start with Windows", "autostart", self.autostart)
         switch(p, "Start minimized", "start_min")
@@ -3163,19 +3411,35 @@ class App(ctk.CTk):
         self.bg(work, done)
         return None
 
+    def root_hwnd(self):
+        return user32.GetAncestor(self.winfo_id(), 2)
+
+    def eco_self(self, on):
+        if self.core.db.flag("self_eco") and getattr(self, "_eco", None) != on:
+            self._eco = on
+            os_set_eco(os.getpid(), on)
+
     def tick(self):
+        db = self.core.db
+        delay = db.num("ui_iv", 1, 10) * 1000
         try:
+            iconic = self.state() == "iconic"
+            idle = iconic or (user32.GetForegroundWindow() or 0) != (self.root_hwnd() or 0)
+            self.eco_self(idle)
             while self.core.toastq:
                 m, k = self.core.toastq.pop(0)
                 self.toast(m, k)
-            self.pages[self.current].refresh()
-            n = len(self.core.snapshot())
-            self.dot.configure(text_color=OK if n else T["muted"])
-            if not self.small:
-                self.status.configure(text=f" {n} running")
+            if not (iconic and db.flag("ui_pause")):
+                self.pages[self.current].refresh()
+                n = len(self.core.snapshot())
+                self.dot.configure(text_color=OK if n else T["muted"])
+                if not self.small:
+                    self.status.configure(text=f" {n} running")
+            if idle and db.flag("ui_pause"):
+                delay = max(delay, 4000)
         except Exception as e:
             self.core.log(f"UI error: {e}")
-        self.after(1200, self.tick)
+        self.after(delay, self.tick)
 
     def on_close(self):
         try:
