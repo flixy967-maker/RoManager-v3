@@ -9,11 +9,17 @@ Not implemented (no fake buttons): tray icon, language packs, auto-updater,
 whole-file database encryption (secrets are DPAPI-encrypted per field), adopting
 Roblox clients that were started before RoManager.
 
+Build as an exe with: pyinstaller --onefile --windowed --name RoManager romanager.py
+
 Changes in this version:
   * Splash screen is built from plain tkinter widgets, so rebuilding the UI / changing the widget
     scaling can no longer destroy its labels (fixes: TclError invalid command name ".!splash...label").
   * No background process: closing the window ends RoManager completely (threads stopped, the login
     window process killed, multi-instance objects released, then the process exits).
+  * Frozen (.exe) builds no longer appear as a window-less background process: stdout/stderr are
+    redirected when a --windowed PyInstaller build leaves them as None (previously any stray print()
+    could crash the process silently before a window ever opened), and a single-instance guard now
+    brings the existing window to the front instead of starting an invisible duplicate process.
 """
 import collections, ctypes, hashlib, hmac, io, json, math, os, queue, random
 import re, secrets, shutil, sqlite3, subprocess, sys, threading, time, urllib.error
@@ -22,6 +28,20 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, messagebox, simpledialog
+
+# --- exe / background-process fix -----------------------------------------
+# A windowed PyInstaller build (no console) gives this process sys.stdout
+# and sys.stderr set to None. Any print()/write() call anywhere (this file
+# or a library) then raises before a window ever appears, and because there
+# is no console to show the error, the process just sits in Task Manager
+# with no window and quietly dies or lingers - "running in the background"
+# with nothing to show for it. Redirecting to os.devnull up front removes
+# that failure mode.
+if getattr(sys, "frozen", False):
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
 
 if sys.platform != "win32":
     print("RoManager only runs on Windows 10/11.")
@@ -46,6 +66,8 @@ crypt32 = ctypes.windll.crypt32
 kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 kernel32.CreateMutexW.restype = ctypes.c_void_p
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+user32.FindWindowW.restype = ctypes.c_void_p
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 psapi = ctypes.windll.psapi
 kernel32.OpenProcess.restype = ctypes.c_void_p
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -4268,6 +4290,31 @@ def install_crash_logging():
     threading.excepthook = lambda a: _log_crash("".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
 
 
+def single_instance_guard():
+    """Stops a second RoManager.exe from starting as an invisible duplicate
+    process. Without this, double-clicking the exe while RoManager is
+    already running (or an autostart entry firing twice) spins up a second
+    process that never shows a window of its own - exactly the "runs in
+    the background instead of opening" symptom. Here the new process
+    detects the existing one, brings its window to the front, and exits.
+    This must only run on the normal app path - never for the --login
+    subprocess, which is a second process of the same exe spawned on
+    purpose and must be allowed to run alongside the main window."""
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.restype = ctypes.c_void_p
+    k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    mutex = k.CreateMutexW(None, True, "RoManager_SingleInstance_Mutex")
+    if not mutex or ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        hwnd = user32.FindWindowW(None, APP_NAME) or user32.FindWindowW(None, "RoManager locked")
+        if hwnd:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+        return False
+    globals()["_SINGLE_INSTANCE_MUTEX"] = mutex  # keep a reference alive for the life of the process
+    return True
+
+
 def unlock(core):
     ok, tries = [False], [0]
     w = ctk.CTk()
@@ -4304,6 +4351,12 @@ def main():
         login_window()
         return
     install_crash_logging()
+    if not single_instance_guard():
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
     try:
         core = Core()
     except Exception as e:
@@ -4326,4 +4379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
