@@ -10,26 +10,44 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
-
-      - name: Create application icon
         run: |
-          python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('icon.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
+          python -m pip install --upgrade pip
+          pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
 
-      - name: Build EXE
+      - name: Prepare icon
+        shell: python
         run: |
-          pyinstaller --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+          import os
+          from PIL import Image
 
-      - name: Upload EXE
+          if not os.path.exists("icon.png"):
+              raise FileNotFoundError("icon.png is missing from the repository root!")
+
+          img = Image.open("icon.png").convert("RGBA")
+          img.save(
+              "icon.ico",
+              format="ICO",
+              sizes=[(256, 256), (128, 128), (64, 64),
+                     (48, 48), (32, 32), (16, 16)]
+          )
+
+      - name: Build executable
+        run: |
+          python -m PyInstaller --clean --noconfirm --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+
+      - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: RoManager-exe
           path: dist/RoManager.exe
+          if-no-files-found: error
 ```
