@@ -9,6 +9,18 @@ Roblox clients that were started before RoManager.
 Build as an exe with:
   pyinstaller --onedir --windowed --name RoManager --collect-all customtkinter --collect-all webview romanager.py
 (--onefile also works, but every login window then re-extracts the exe and starts slower.)
+Debug build (shows a console with errors): same command with --console instead of --windowed.
+
+Start-up guarantees in this version:
+  * The main window is never hidden with withdraw(). It is transparent while it is built, then it is made visible
+    and a loop verifies that Windows really shows it (re-showing it, and moving it on-screen, if not).
+  * A second launch finds the running window by Tk class + title (not by title alone), shows it even if it was
+    hidden, and if the running copy has no window at all it offers to end that stale copy and start fresh.
+  * Nothing slow runs before the window exists: the multi-instance mutex is set up in a background thread, and
+    RoManager's own CPU ceiling / efficiency mode start only a few seconds after the window is visible.
+  * "Start minimized" only applies when Windows autostarts RoManager (--autostart). Double-click always shows it.
+  * startup.log (in %APPDATA%\\RoManager) records every start-up step; a watchdog writes thread stacks to crash.log
+    and shows a message box if the window is not visible within 45 seconds.
 
 Lifecycle guarantees in this version:
   * Closing the window ends RoManager completely: worker threads stop, the login window process tree is killed,
@@ -19,7 +31,6 @@ Lifecycle guarantees in this version:
     when RoManager is gone, or after 30 minutes. It is also placed in a kill-on-close job object.
   * Startup errors and crashes in a windowed exe are shown in a message box and written to crash.log,
     and the process still exits cleanly afterwards.
-  * A second launch brings the running window to the front instead of starting an invisible duplicate.
   * Logs, history tables and temp files are bounded, and per-client job handles are closed when a client exits.
 """
 import collections, ctypes, hashlib, hmac, io, json, math, os, queue, random
@@ -68,6 +79,27 @@ APP_NAME = "RoManager"
 APPDIR = Path(os.environ.get("APPDATA", ".")) / APP_NAME
 PROC_NAME = "RobloxPlayerBeta.exe"
 NCPU = psutil.cpu_count() or 1
+READY = threading.Event()  # set once the main window has been verified visible
+
+
+def _trace(msg):
+    """Start-up breadcrumb: %APPDATA%\\RoManager\\startup.log shows how far a start got."""
+    try:
+        APPDIR.mkdir(parents=True, exist_ok=True)
+        with open(APPDIR / "startup.log", "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%H:%M:%S.%f}] pid={os.getpid()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _trace_reset():
+    try:
+        f = APPDIR / "startup.log"
+        if f.exists() and f.stat().st_size > 100_000:
+            f.unlink()
+    except Exception:
+        pass
+
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -1142,6 +1174,7 @@ class Core:
         self.ram_lifted, self.relax, self.ram_extra = False, 0, 0
         self.meter, self.disk_hot, self.disk_cool, self.disk_pct, self.pages_s = None, 0, 0, 0.0, 0.0
         self.holder = None
+        self.multi_lock = threading.Lock()  # set_multi can be called from the start-up thread and the launch queue
         self.multi_status = "Multi-instance is off."
         self.last_net = None
         self.qs = {"running": False, "total": 0, "done": 0, "failed": 0}
@@ -1171,7 +1204,14 @@ class Core:
         psutil.cpu_percent(None)
         threading.Thread(target=self.sample_loop, daemon=True).start()
         threading.Thread(target=self.gpu_loop, daemon=True).start()
-        self.log(self.set_multi(True))
+        # multi-instance setup can take a moment; it must never delay the window, so it runs in the background
+        threading.Thread(target=self._init_multi, daemon=True).start()
+
+    def _init_multi(self):
+        try:
+            self.log(self.set_multi(True))
+        except Exception as e:
+            self.log(f"Multi-instance setup failed: {e}")
 
     def shutdown(self):
         """Stop every background activity of RoManager and take back every limit it put on your Roblox clients.
@@ -1188,8 +1228,12 @@ class Core:
                 release_client(c)
             except Exception:
                 pass
-        try:
-            self.set_multi(False)  # release the single-instance mutex/event
+        try:  # release the single-instance mutex/event (not through the lock: the start-up thread may hold it)
+            h = self.holder
+            if h:
+                h["stop"].set()
+            self.holder = None
+            self.mutex = None
         except Exception:
             pass
         try:
@@ -1251,6 +1295,10 @@ class Core:
                 k.CloseHandle(h)
 
     def set_multi(self, on):
+        with self.multi_lock:
+            return self._set_multi(on)
+
+    def _set_multi(self, on):
         if not on:
             if self.holder:
                 self.holder["stop"].set()
@@ -4021,7 +4069,7 @@ class SettingsPage(Page):
         p = section("General", "Closing the RoManager window always ends the whole program. Nothing keeps running in the background "
                                "(your Roblox clients stay open).")
         switch(p, "Start with Windows", "autostart", self.autostart)
-        switch(p, "Start minimized", "start_min")
+        switch(p, "Start minimized (only when started with Windows)", "start_min")
         p = section("Launch")
         entry(p, "Default launch delay (seconds)", "delay")
         entry(p, "Default destination", "default_dest", 320)
@@ -4075,7 +4123,9 @@ class SettingsPage(Page):
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as k:
                 if self.core.db.flag("autostart"):
-                    cmd = f'"{sys.executable}"' if getattr(sys, "frozen", False) else f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+                    # --autostart tells RoManager it was started by Windows (only then "Start minimized" applies)
+                    cmd = f'"{sys.executable}" --autostart' if getattr(sys, "frozen", False) \
+                        else f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}" --autostart'
                     winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, cmd)
                 else:
                     try:
@@ -4205,9 +4255,20 @@ class App(ctk.CTk):
 
     def __init__(self, core):
         super().__init__()
-        self.withdraw()
+        _trace("App: root window created")
+        # IMPORTANT: the window is never withdrawn. CustomTkinter hides and re-shows its own window on Windows
+        # (title bar recolouring) and restores the state it remembered, so a window that is withdrawn while that
+        # happens can stay hidden forever. Instead it is fully transparent while it is built, and
+        # finish_startup() / ensure_visible() make it visible and verify that Windows really shows it.
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
         self.core = core
         self.closing = False
+        self._starting = True
+        self._vis_ok = self._vis_tries = 0
+        self._ready_at = time.time() + 6  # own CPU ceiling / efficiency mode start only after this
         self.selected, self.avatars, self.uiq, self.toasts = set(), {}, queue.Queue(), []
         self.current = "Home"
         self.title(APP_NAME)
@@ -4219,30 +4280,123 @@ class App(ctk.CTk):
         sc = core.db.num("ui_scale", 80, 140) / 100
         ctk.set_widget_scaling(sc)
         ctk.set_window_scaling(sc)
-        splash = Splash(self)
-        splash.step("Preparing the interface…", 0.25)
-        self.build()
-        splash.step("Loading your accounts…", 0.6)
-        self.show("Home")
-        style_window(self)
-        splash.step("Almost ready…", 0.9)
-        self.after(100, self.pump)
-        self.after(1000, self.tick)
-        if not core.mutex:
-            self.after(1200, lambda: self.toast(core.multi_status, "warn"))
-        if not roblox_installed():
-            self.after(900, lambda: self.toast("Roblox Player not found for this Windows user. Install it from roblox.com.", "warn"))
-        splash.step("Ready", 1.0)
+        splash = None
+        try:
+            splash = Splash(self)
+            splash.step("Preparing the interface…", 0.25)
+            self.build()
+            _trace("App: interface built")
+            splash.step("Loading your accounts…", 0.6)
+            self.show("Home")
+            _trace("App: home page shown")
+            style_window(self)
+            splash.step("Almost ready…", 0.9)
+            self.after(100, self.pump)
+            self.after(1000, self.tick)
+            self.after(3000, lambda: None if (self.closing or core.mutex) else self.toast(core.multi_status, "warn"))
+            if not roblox_installed():
+                self.after(900, lambda: self.toast("Roblox Player not found for this Windows user. Install it from roblox.com.", "warn"))
+            splash.step("Ready", 1.0)
+        except BaseException:
+            try:  # never leave a topmost splash covering the error message
+                if splash is not None:
+                    splash.alive = False
+                    splash.destroy()
+            except Exception:
+                pass
+            raise
         splash.close()
-        if core.db.flag("start_min"):
-            self.iconify()
-        else:
-            if core.db.flag("anim"):
-                self.attributes("-alpha", 0.0)
-            self.deiconify()
-            if core.db.flag("anim"):
-                self.fade(0)
-            self.bring_to_front()
+        self.finish_startup()
+
+    # ---- making the window visible, and proving it
+    def finish_startup(self):
+        db = self.core.db
+        self._starting = False
+        target = db.num("opacity", 50, 100) / 100
+        # "Start minimized" only applies when Windows started RoManager (--autostart); a double-click always opens it
+        minimized = db.flag("start_min") and "--autostart" in sys.argv
+        try:
+            self.update_idletasks()
+            if minimized:
+                self.attributes("-alpha", target)
+                self.iconify()
+            else:
+                self.deiconify()
+                self.update_idletasks()
+                self.fit_on_screen()
+                if db.flag("anim"):
+                    self.fade(0)
+                else:
+                    self.attributes("-alpha", target)
+                self.bring_to_front()
+        except Exception as e:
+            _log_crash(f"finish_startup failed: {e!r}")
+            try:
+                self.attributes("-alpha", target)
+                self.deiconify()
+            except Exception:
+                pass
+        _trace("App: finish_startup done, window requested")
+        self.after(300, self.ensure_visible)
+        self.after(4000, self._late_limits)
+
+    def _late_limits(self):
+        """RoManager's own CPU ceiling starts only once the window is up (a 15% ceiling during the build made it crawl)."""
+        if not self.closing:
+            set_self_cap(self.core.db.num("app_cap", 5, 100))
+
+    def fit_on_screen(self):
+        """Puts the window fully on a monitor, and no bigger than the work area (small / scaled screens)."""
+        try:
+            hwnd = self.root_hwnd()
+            if not hwnd or user32.IsIconic(hwnd):
+                return
+            x, y, w, h = win_rect(hwnd)
+            mons = monitors()
+            mx, my, mw, mh = mons[0]
+            on_screen = any(min(x + w, m[0] + m[2]) - max(x, m[0]) > 120 and min(y + h, m[1] + m[3]) - max(y, m[1]) > 80
+                            for m in mons)
+            if on_screen and w <= mw and h <= mh:
+                return
+            nw, nh = min(w, mw), min(h, mh)
+            win_place(hwnd, mx + (mw - nw) // 2, my + (mh - nh) // 2, nw, nh)
+            _trace(f"App: window moved on-screen (was {w}x{h} at {x},{y})")
+        except Exception:
+            pass
+
+    def ensure_visible(self):
+        """Verifies that Windows really shows the window; if not (hidden by a withdraw race, off-screen, still
+        transparent) it is forced visible. Runs until the window has stayed visible for about a second."""
+        if self.closing:
+            return
+        self._vis_tries += 1
+        target = self.core.db.num("opacity", 50, 100) / 100
+        try:
+            hwnd = self.root_hwnd()
+            shown = bool(hwnd) and bool(user32.IsWindowVisible(hwnd))  # a minimized window counts as visible
+            if not shown:
+                self._vis_ok = 0
+                _trace("ensure_visible: window was NOT visible, forcing it")
+                try:
+                    self.deiconify()
+                except tk.TclError:
+                    pass
+                if hwnd:
+                    user32.ShowWindow(hwnd, 5)
+                self.attributes("-alpha", target)
+                self.fit_on_screen()
+                self.bring_to_front()
+            else:
+                self._vis_ok += 1
+                if self._vis_ok >= 4:
+                    self.attributes("-alpha", target)  # in case the fade-in never completed
+                    _trace("App: window is visible")
+                    READY.set()
+                    return
+        except Exception as e:
+            _trace(f"ensure_visible error: {e!r}")
+        if self._vis_tries < 150:
+            self.after(300, self.ensure_visible)
 
     def bring_to_front(self):
         """Windows often opens a new window behind others. Raise it, take focus, and drop the temporary
@@ -4286,7 +4440,7 @@ class App(ctk.CTk):
         self.toasts = []
         self.configure(fg_color=T["bg"])
         self.attributes("-topmost", db.flag("topmost"))
-        if not db.flag("anim") and db.num("opacity", 50, 100) < 100:
+        if not self._starting and not db.flag("anim") and db.num("opacity", 50, 100) < 100:
             self.attributes("-alpha", db.num("opacity", 50, 100) / 100)
         small = db.flag("sidebar_small")
         self.grid_columnconfigure(1, weight=1)
@@ -4457,10 +4611,11 @@ class App(ctk.CTk):
         try:
             iconic = self.state() == "iconic"
             idle = iconic or (user32.GetForegroundWindow() or 0) != (self.root_hwnd() or 0)
-            self.eco_self(idle or db.flag("self_eco_always"))
-            if idle and time.time() - getattr(self, "_trim_t", 0) > 120:
-                self._trim_t = time.time()
-                os_trim(os.getpid())  # hand back unused memory while nobody is looking
+            if time.time() >= self._ready_at:  # never throttle RoManager while it is still starting up
+                self.eco_self(idle or db.flag("self_eco_always"))
+                if idle and time.time() - getattr(self, "_trim_t", 0) > 120:
+                    self._trim_t = time.time()
+                    os_trim(os.getpid())  # hand back unused memory while nobody is looking
             while self.core.toastq:
                 m, k = self.core.toastq.pop(0)
                 self.toast(m, k)
@@ -4528,26 +4683,140 @@ def install_crash_logging():
     threading.excepthook = lambda a: _log_crash("".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
 
 
+def _startup_watchdog(seconds=45):
+    """If the main window is not verified visible within `seconds`, say so instead of lingering invisibly:
+    thread stacks go to crash.log and a message box explains what to look at."""
+    def run():
+        if READY.wait(seconds):
+            return
+        import traceback
+        parts = []
+        try:
+            for tid, fr in sys._current_frames().items():
+                parts.append(f"--- thread {tid}\n" + "".join(traceback.format_stack(fr)))
+        except Exception:
+            pass
+        _log_crash(f"Start-up did not finish within {seconds}s (the window never became visible).\n" + "\n".join(parts))
+        _trace("WATCHDOG: window never became visible")
+        try:
+            user32.MessageBoxW(0, f"RoManager did not manage to show its window within {seconds} seconds.\n\n"
+                                  f"Details were written to:\n{APPDIR / 'crash.log'}\n{APPDIR / 'startup.log'}",
+                               APP_NAME, 0x10)
+        except Exception:
+            pass
+        os._exit(1)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ---- single instance ------------------------------------------------------------------------------------------
 _SINGLE_INSTANCE_MUTEX = None
 
 
+def _find_main_window():
+    """The running RoManager window, matched by Tk window class AND title (a title alone can match an Explorer
+    folder that is called 'RoManager')."""
+    for title in (APP_NAME, "RoManager locked"):
+        h = user32.FindWindowW("TkTopLevel", title)
+        if h:
+            return h
+    return 0
+
+
+def _show_window(hwnd):
+    """Brings another instance's window to the front, even if it was hidden or minimized."""
+    try:
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE also shows a hidden window
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def _other_instances():
+    """Other RoManager processes (not this one, not its launcher parent, not login-window helpers)."""
+    me = psutil.Process()
+    skip = {me.pid}
+    try:
+        skip |= {p.pid for p in me.parents()}
+    except psutil.Error:
+        pass
+    try:
+        skip |= {p.pid for p in me.children(recursive=True)}
+    except psutil.Error:
+        pass
+    exe = os.path.normcase(sys.executable)
+    script = os.path.normcase(os.path.abspath(sys.argv[0]))
+    out = []
+    for p in psutil.process_iter(["pid", "exe", "cmdline"]):
+        try:
+            if p.info["pid"] in skip:
+                continue
+            cmd = p.info["cmdline"] or []
+            if "--login" in cmd:
+                continue
+            if getattr(sys, "frozen", False):
+                match = os.path.normcase(p.info["exe"] or "") == exe
+            else:
+                match = any(os.path.normcase(os.path.abspath(a)) == script for a in cmd[1:3])
+            if match:
+                out.append(p)
+        except (psutil.Error, OSError, ValueError):
+            pass
+    return out
+
+
 def single_instance_guard():
-    """Stops a second RoManager.exe from starting as an invisible duplicate process. The new process detects the
-    running one, brings its window to the front, and exits. This only runs on the normal app path - never for the
-    --login subprocess, which is a second process of the same exe spawned on purpose."""
+    """Stops a second RoManager from running side by side, WITHOUT ever exiting silently:
+      * a running copy with a window is shown (even if hidden or minimized) and this process exits;
+      * a running copy WITHOUT a window (hidden / stuck) is offered to be ended so this launch can start fresh;
+      * if the owner of the lock cannot be found, this launch simply starts.
+    Only runs on the normal app path - never for the --login subprocess."""
     global _SINGLE_INSTANCE_MUTEX
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     k.CreateMutexW.restype = ctypes.c_void_p
     k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    mutex = k.CreateMutexW(None, True, "RoManager_SingleInstance_Mutex")
-    if not mutex or ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        hwnd = user32.FindWindowW(None, APP_NAME) or user32.FindWindowW(None, "RoManager locked")
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    for attempt in range(2):
+        mutex = k.CreateMutexW(None, True, "RoManager_SingleInstance_Mutex")
+        err = ctypes.get_last_error()
+        if mutex and err != 183:  # we are the first instance
+            _SINGLE_INSTANCE_MUTEX = mutex  # keep it alive for the life of the process
+            return True
+        if mutex:
+            k.CloseHandle(mutex)  # drop our reference so the lock can disappear when its owner dies
+        _trace(f"guard: another instance owns the lock (attempt {attempt + 1})")
+        hwnd = 0
+        for _ in range(20):  # the other copy may still be starting up: give it up to ~6 seconds
+            hwnd = _find_main_window()
+            if hwnd:
+                break
+            time.sleep(0.3)
         if hwnd:
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 9)
-            user32.SetForegroundWindow(hwnd)
-        return False
-    _SINGLE_INSTANCE_MUTEX = mutex  # keep it alive for the life of the process
+            _trace("guard: showing the running window and exiting")
+            _show_window(hwnd)
+            return False
+        others = _other_instances()
+        if not others:
+            _trace("guard: lock owner not found, starting anyway")
+            return True
+        if attempt == 1:
+            break
+        ans = user32.MessageBoxW(0, "RoManager is already running in the background but has no window "
+                                    "(a hidden or stuck copy).\n\nEnd that copy and start RoManager fresh?\n"
+                                    "(Your Roblox clients are not touched.)", APP_NAME, 0x24)
+        if ans != 6:  # IDYES
+            return False
+        for p in others:
+            try:
+                p.kill()
+            except psutil.Error:
+                pass
+        try:
+            psutil.wait_procs(others, timeout=3)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    _trace("guard: could not take over the lock, starting anyway")
     return True
 
 
@@ -4577,7 +4846,18 @@ def unlock(core):
 
     e.bind("<Return>", go)
     btn(w, "Unlock", go, "accent", w=120).pack(pady=6)
-    e.focus_set()
+
+    def front():  # make sure the lock window is not opened behind other windows
+        try:
+            w.lift()
+            w.attributes("-topmost", True)
+            w.after(600, lambda: w.attributes("-topmost", False))
+            w.focus_force()
+            e.focus_set()
+        except Exception:
+            pass
+
+    w.after(150, front)
     w.mainloop()
     return ok[0]
 
@@ -4587,31 +4867,40 @@ def main():
         login_window()
         os._exit(0)
     install_crash_logging()
+    _trace_reset()
+    _trace("main: start (frozen=%s, argv=%s)" % (getattr(sys, "frozen", False), sys.argv[1:]))
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
     if not single_instance_guard():
+        _trace("main: handled by the single-instance guard, exiting")
         os._exit(0)
     core = None
     try:
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
         try:
             core = Core()
         except Exception as e:
             _log_crash(f"Database unavailable: {e!r}")
             user32.MessageBoxW(0, f"Database unavailable:\n{e}", APP_NAME, 0x10)
             return
+        _trace("main: database open")
         apply_theme(core.db)
         if core.db.get("lock_hash") and not unlock(core):
             return
+        _startup_watchdog(45)  # from here on, a window that never appears is reported instead of lingering
         sys.setswitchinterval(0.005)
-        core.start()
-        set_self_cap(core.db.num("app_cap", 5, 100))
-        App(core).mainloop()
+        core.start()  # background threads only; nothing here can delay the window
+        _trace("main: core started, building the window")
+        app = App(core)
+        _trace("main: entering mainloop")
+        app.mainloop()
+        _trace("main: mainloop ended")
     except Exception:
         import traceback
         tb = traceback.format_exc()
         _log_crash(tb)
+        _trace("main: EXCEPTION during start-up, see crash.log")
         try:
             user32.MessageBoxW(0, "RoManager hit an error and will close.\n\n" + tb[-900:] +
                                f"\n\nDetails: {APPDIR / 'crash.log'}", APP_NAME, 0x10)
