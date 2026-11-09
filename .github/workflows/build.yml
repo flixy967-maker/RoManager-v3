@@ -18,56 +18,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
+          pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
 
-      - name: Find and create icon
-        shell: pwsh
-        run: |
-          if (Test-Path "icon.png") {
-              $iconPath = "icon.png"
-          }
-          elseif (Test-Path "assets/icon.png") {
-              $iconPath = "assets/icon.png"
-          }
-          else {
-              Write-Host "ERROR: icon.png was not found."
-              Write-Host "Repository files:"
-              Get-ChildItem -Recurse -File | Select-Object FullName
-              exit 1
-          }
-
-          python -c "import sys; from PIL import Image; img=Image.open(sys.argv[1]).convert('RGBA'); img.save('icon.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])" $iconPath
-
-          if (!(Test-Path "icon.ico")) {
-              throw "Icon conversion failed!"
-          }
-
-      - name: Check application file
+      - name: Check files
         shell: pwsh
         run: |
           if (!(Test-Path "romanager.py")) {
-              throw "romanager.py was not found!"
+              throw "romanager.py not found!"
+          }
+
+          if (!(Test-Path "icon.ico")) {
+              throw "icon.ico not found in repository root!"
           }
 
       - name: Build RoManager EXE
-        shell: pwsh
         run: |
-          python -m PyInstaller `
-            --clean `
-            --noconfirm `
-            --noconsole `
-            --onefile `
-            --name RoManager `
-            --icon=icon.ico `
-            --collect-all customtkinter `
-            --collect-all webview `
-            --collect-all pythonnet `
-            --collect-all clr_loader `
-            --hidden-import clr `
-            romanager.py
+          python -m PyInstaller --clean --noconfirm --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
