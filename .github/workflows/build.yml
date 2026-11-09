@@ -1,18 +1,27 @@
+```yaml
 name: Build RoManager exe
+
 on:
   push:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
-      - run: pyinstaller --noconsole --onefile --name RoManager --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+
+      - run: pyinstaller --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: RoManager-exe
           path: dist/RoManager.exe
+```
