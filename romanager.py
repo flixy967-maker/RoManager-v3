@@ -3900,6 +3900,23 @@ class App(ctk.CTk):
             self.deiconify()
             if core.db.flag("anim"):
                 self.fade(0)
+            self.bring_to_front()
+
+    def bring_to_front(self):
+        """Windows often opens a new window behind others. Raise it, take focus, and drop the temporary
+        always-on-top flag again (unless 'Keep RoManager on top' is on)."""
+        try:
+            self.update_idletasks()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(400, lambda: self.attributes("-topmost", self.core.db.flag("topmost")))
+            self.focus_force()
+            hwnd = self.root_hwnd()
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)
+                user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
 
     def report_callback_exception(self, exc, val, tb):
         import traceback
