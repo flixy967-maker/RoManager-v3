@@ -8,6 +8,12 @@ from the first runs.
 Not implemented (no fake buttons): tray icon, language packs, auto-updater,
 whole-file database encryption (secrets are DPAPI-encrypted per field), adopting
 Roblox clients that were started before RoManager.
+
+Changes in this version:
+  * Splash screen is built from plain tkinter widgets, so rebuilding the UI / changing the widget
+    scaling can no longer destroy its labels (fixes: TclError invalid command name ".!splash...label").
+  * No background process: closing the window ends RoManager completely (threads stopped, the login
+    window process killed, multi-instance objects released, then the process exits).
 """
 import collections, ctypes, hashlib, hmac, io, json, math, os, queue, random
 import re, secrets, shutil, sqlite3, subprocess, sys, threading, time, urllib.error
@@ -224,6 +230,19 @@ class DB:
                     old.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def close(self):
+        """Flush and close the database so no -wal/-shm handle is left behind."""
+        with self.lock:
+            try:
+                self.c.commit()
+                self.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
+                self.c.close()
+            except Exception:
+                pass
 
     def q(self, sql, args=()):
         with self.lock:
@@ -557,16 +576,36 @@ def login_window():
         fail(traceback.format_exc())
 
 
+_LOGIN_PROCS = []  # login-window subprocesses, so closing RoManager can end them too
+
+
+def kill_login_procs():
+    for p in list(_LOGIN_PROCS):
+        try:
+            parent = psutil.Process(p.pid)
+            for ch in parent.children(recursive=True):  # the WebView2 helper processes
+                try:
+                    ch.kill()
+                except psutil.Error:
+                    pass
+            parent.kill()
+        except psutil.Error:
+            pass
+    _LOGIN_PROCS.clear()
+
+
 def browser_login(user=None, pw=None):
     tok = secrets.token_hex(8)
     base = _tmpdir() / tok
     cmd = [sys.executable, "--login", tok] if getattr(sys, "frozen", False) else \
         [sys.executable, os.path.abspath(sys.argv[0]), "--login", tok]
+    proc = None
     try:
         if user and pw:
             base.with_suffix(".in").write_bytes(dpapi_protect(json.dumps({"u": user, "p": pw}).encode()))
         proc = subprocess.Popen(cmd, creationflags=0x08000000, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _LOGIN_PROCS.append(proc)
         proc.wait()  # no time limit: it ends when you finish logging in or close the window
         out, err = base.with_suffix(".out"), base.with_suffix(".err")
         if out.exists():
@@ -574,6 +613,8 @@ def browser_login(user=None, pw=None):
         hint = err.read_text(encoding="utf-8", errors="ignore")[-700:] if err.exists() else ""
         raise RuntimeError("The login window was closed before login finished." + (f"\n\n{hint}" if hint else ""))
     finally:
+        if proc is not None and proc in _LOGIN_PROCS:
+            _LOGIN_PROCS.remove(proc)
         for ext in (".in", ".out", ".err"):
             _wipe(base.with_suffix(ext))
 
@@ -953,8 +994,16 @@ class Core:
         self.log(self.set_multi(True))
 
     def shutdown(self):
+        """Stop every background activity of RoManager. Roblox clients you launched are left running."""
         self.stop = True
         self.cancel_ev.set()
+        self.pause_ev.set()
+        try:
+            self.set_multi(False)  # release the single-instance mutex/event
+        except Exception:
+            pass
+        kill_login_procs()
+        self.db.close()
 
     def notify(self, kind, text):
         if not self.db.flag("wh_on") or not self.db.flag("n_" + kind):
@@ -1150,7 +1199,9 @@ class Core:
                 self.log(f"{name}: started (PID {pid})", "ok")
                 others = {c["pid"] for c in self.snapshot() if c["pid"] != pid}
                 if others:
-                    threading.Timer(8, self._check_kill, args=(others, name)).start()
+                    t = threading.Timer(8, self._check_kill, args=(others, name))
+                    t.daemon = True
+                    t.start()
             except Exception as e:
                 self.qs["failed"] += 1
                 self.failed += 1
@@ -1411,6 +1462,8 @@ class Core:
 
     def apply_when_ready(self, pid):
         for _ in range(40):
+            if self.stop:
+                return
             with self.lock:
                 c = self.clients.get(pid)
             if not c:
@@ -1519,6 +1572,8 @@ class Core:
         wait = 4
         while not self.stop:
             time.sleep(wait)
+            if self.stop:
+                break
             wait = 10  # relaxed, unless a client needed adjusting
             try:
                 pr = self.profile()
@@ -1563,6 +1618,8 @@ class Core:
         while not self.stop:
             iv = self.profile()["interval"]
             time.sleep(iv if self.clients else max(iv, 10))
+            if self.stop:
+                break
             try:
                 self.sample()
             except Exception as e:
@@ -1682,6 +1739,8 @@ class Core:
             n += 1
             self.attempts[aid] = n
             time.sleep(self.db.num("restart_delay", 1, 3600))
+            if self.stop:
+                return
             try:
                 self.launch_one(aid, dest)
                 self.db.q("INSERT INTO recovery_history(account_id,ts,attempt,result) VALUES(?,?,?,?)",
@@ -3706,7 +3765,8 @@ class SettingsPage(Page):
         switch(p, "Efficiency mode all the time, not only while idle", "self_eco_always")
         slider_row(p, "RoManager CPU ceiling (hard limit)", 5, 100, 19, db.num("app_cap", 5, 100), lambda v: f"{int(v)}%",
                    save=lambda v: (db.set("app_cap", int(v)), set_self_cap(int(v))))
-        p = section("General")
+        p = section("General", "Closing the RoManager window always ends the whole program. Nothing keeps running in the background "
+                               "(your Roblox clients stay open).")
         switch(p, "Start with Windows", "autostart", self.autostart)
         switch(p, "Start minimized", "start_min")
         p = section("Launch")
@@ -3815,38 +3875,62 @@ class SettingsPage(Page):
 
 
 # ------------------------------------------------------------------- App ---
-class Splash(ctk.CTkToplevel):
-    """Loading screen shown while the interface is built."""
+class Splash(tk.Toplevel):
+    """Loading screen shown while the interface is built.
+
+    Built only from plain tkinter widgets on purpose. customtkinter widgets are re-created whenever the
+    widget scaling changes (App.build() does that), which destroyed the inner label of the old splash and
+    caused: _tkinter.TclError: invalid command name ".!splash.!ctkframe.!ctklabel3.!label".
+    Every call here is also guarded, so a splash problem can never stop the app from starting."""
 
     def __init__(self, app):
         super().__init__(app)
-        self.overrideredirect(True)
-        w, h = 460, 290
-        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 2}")
-        self.configure(fg_color=T["bg"])
-        self.attributes("-topmost", True)
-        box = ctk.CTkFrame(self, fg_color=T["panel"], border_color=T["border"], border_width=1, corner_radius=R + 6)
-        box.pack(fill="both", expand=True, padx=1, pady=1)
-        ctk.CTkLabel(box, text="◈", font=F(54, True), text_color=T["accent"]).pack(pady=(30, 0))
-        ctk.CTkLabel(box, text="RoManager", font=F(28, True), text_color=T["text"]).pack()
-        self.msg = ctk.CTkLabel(box, text="Starting…", font=F(12), text_color=T["muted"])
-        self.msg.pack(pady=(6, 16))
-        self.bar = ctk.CTkProgressBar(box, height=6, width=320, progress_color=T["accent"], fg_color=T["panel2"])
-        self.bar.set(0)
-        self.bar.pack()
-        self.update()
+        self.alive = True
+        self.msg = self.bar = None
+        try:
+            self.overrideredirect(True)
+            w, h = 460, 290
+            self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 2}")
+            self.configure(bg=T["border"])
+            self.attributes("-topmost", True)
+            box = tk.Frame(self, bg=T["panel"])
+            box.pack(fill="both", expand=True, padx=1, pady=1)
+            tk.Label(box, text="◈", font=(FONT_FAMILY, 40, "bold"), fg=T["accent"], bg=T["panel"]).pack(pady=(30, 0))
+            tk.Label(box, text="RoManager", font=(FONT_FAMILY, 22, "bold"), fg=T["text"], bg=T["panel"]).pack()
+            self.msg = tk.Label(box, text="Starting…", font=(FONT_FAMILY, 10), fg=T["muted"], bg=T["panel"])
+            self.msg.pack(pady=(6, 16))
+            self.track = tk.Canvas(box, width=320, height=6, bg=T["panel2"], highlightthickness=0)
+            self.track.pack()
+            self.fill = self.track.create_rectangle(0, 0, 0, 6, fill=T["accent"], width=0)
+            self.update()
+        except tk.TclError:
+            self.alive = False
 
     def step(self, text, value):
-        self.msg.configure(text=text)
-        self.bar.set(value)
-        self.update()
+        if not self.alive:
+            return
+        try:
+            self.msg.configure(text=text)
+            self.track.coords(self.fill, 0, 0, int(320 * max(0.0, min(1.0, value))), 6)
+            self.update()
+        except tk.TclError:
+            self.alive = False
 
     def close(self):
-        for i in range(8):
-            self.attributes("-alpha", 1 - i / 8)
-            self.update()
-            time.sleep(0.01)
-        self.destroy()
+        if not self.alive:
+            return
+        self.alive = False
+        try:
+            for i in range(8):
+                self.attributes("-alpha", 1 - i / 8)
+                self.update()
+                time.sleep(0.01)
+        except tk.TclError:
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
 
 
 class LazyPages(dict):
@@ -3870,6 +3954,7 @@ class App(ctk.CTk):
         super().__init__()
         self.withdraw()
         self.core = core
+        self.closing = False
         self.selected, self.avatars, self.uiq, self.toasts = set(), {}, queue.Queue(), []
         self.current = "Home"
         self.title(APP_NAME)
@@ -3877,6 +3962,10 @@ class App(ctk.CTk):
         self.minsize(1080, 680)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         apply_theme(core.db)
+        # set the scaling first, so nothing built afterwards (splash included) gets rescaled mid-start-up
+        sc = core.db.num("ui_scale", 80, 140) / 100
+        ctk.set_widget_scaling(sc)
+        ctk.set_window_scaling(sc)
         splash = Splash(self)
         splash.step("Preparing the interface…", 0.25)
         self.build()
@@ -3924,6 +4013,8 @@ class App(ctk.CTk):
         self.core.log(f"UI error: {val}")
 
     def fade(self, n):
+        if self.closing:
+            return
         target = self.core.db.num("opacity", 50, 100) / 100
         self.attributes("-alpha", min(target, n / 10 * target))
         if n < 10:
@@ -4013,6 +4104,8 @@ class App(ctk.CTk):
             self.core.log(f"UI error: {e}")
 
     def toast(self, msg, kind="info"):
+        if self.closing:
+            return
         col = {"ok": OK, "warn": WARN, "bad": BAD, "info": T["accent"]}.get(kind, T["accent"])
         f = ctk.CTkFrame(self, fg_color=T["panel2"], border_color=col, border_width=1, corner_radius=R)
         L(f, {"ok": "✓  ", "warn": "!  ", "bad": "✕  ", "info": "i  "}.get(kind, "") + msg, 12, wraplength=330, justify="left").pack(padx=14, pady=10)
@@ -4027,17 +4120,23 @@ class App(ctk.CTk):
             f.destroy()
         except Exception:
             pass
-        self.layout_toasts()
+        if not self.closing:
+            self.layout_toasts()
 
     def layout_toasts(self):
-        self.update_idletasks()
-        y = 18
-        for f in self.toasts[-5:]:
-            f.place(relx=1.0, x=-18, y=y, anchor="ne")
-            f.lift()
-            y += f.winfo_reqheight() + 8
+        try:
+            self.update_idletasks()
+            y = 18
+            for f in self.toasts[-5:]:
+                f.place(relx=1.0, x=-18, y=y, anchor="ne")
+                f.lift()
+                y += f.winfo_reqheight() + 8
+        except tk.TclError:
+            pass
 
     def pump(self):
+        if self.closing:
+            return
         try:
             while True:
                 fn = self.uiq.get_nowait()
@@ -4058,7 +4157,7 @@ class App(ctk.CTk):
                 r, err = work(), None
             except Exception as e:
                 r, err = None, e
-            if done:
+            if done and not self.closing:
                 self.ui(lambda: done(r, err))
 
         threading.Thread(target=run, daemon=True).start()
@@ -4097,6 +4196,8 @@ class App(ctk.CTk):
             os_set_eco(os.getpid(), on)
 
     def tick(self):
+        if self.closing:
+            return
         db = self.core.db
         delay = db.num("ui_iv", 1, 10) * 1000
         try:
@@ -4124,14 +4225,30 @@ class App(ctk.CTk):
         self.after(delay, self.tick)
 
     def on_close(self):
+        """Closing the window ends RoManager completely: no leftover process, thread or login window.
+        (Roblox clients you launched keep running; they are separate programs.)"""
+        if self.closing:
+            return
+        self.closing = True
         mv = self.pages.get("MultiView")
         if mv:
             try:
                 mv.release_all()  # give embedded Roblox windows back before we exit
             except Exception:
                 pass
-        self.core.shutdown()
-        self.destroy()
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+        try:
+            self.core.shutdown()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        os._exit(0)  # hard stop: nothing of RoManager stays alive in the background
 
 
 def _log_crash(text):
@@ -4194,12 +4311,19 @@ def main():
         return
     apply_theme(core.db)
     if core.db.get("lock_hash") and not unlock(core):
-        return
+        core.shutdown()
+        os._exit(0)
     sys.setswitchinterval(0.005)
     core.start()
     set_self_cap(core.db.num("app_cap", 5, 100))
     App(core).mainloop()
+    # mainloop only returns when the window is gone: make sure nothing stays behind
+    try:
+        core.shutdown()
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":
     main()
+    
