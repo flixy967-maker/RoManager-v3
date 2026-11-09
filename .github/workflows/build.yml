@@ -16,11 +16,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
+      - name: Install dependencies
+        run: pip install customtkinter psutil pillow pywebview pythonnet pyinstaller
 
-      - run: pyinstaller --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+      - name: Create application icon
+        run: |
+          python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('icon.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])"
 
-      - uses: actions/upload-artifact@v4
+      - name: Build EXE
+        run: |
+          pyinstaller --noconsole --onefile --name RoManager --icon=icon.ico --collect-all customtkinter --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr romanager.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
         with:
           name: RoManager-exe
           path: dist/RoManager.exe
