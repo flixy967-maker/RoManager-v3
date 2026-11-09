@@ -44,6 +44,7 @@ psapi = ctypes.windll.psapi
 kernel32.OpenProcess.restype = ctypes.c_void_p
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.GetCurrentProcess.restype = ctypes.c_void_p
 kernel32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
 psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
 kernel32.CreateJobObjectW.restype = ctypes.c_void_p
@@ -103,19 +104,19 @@ def verify_pw(pw: str, stored: str) -> bool:
 # -------------------------------------------------------------- database ---
 DEFAULTS = {
     # appearance
-    "theme": "Midnight", "accent": "", "ui_scale": "100", "radius": "14", "density": "Comfortable",
+    "theme": "Obsidian", "accent": "", "ui_scale": "100", "radius": "18", "density": "Comfortable",
     "font": "Segoe UI", "opacity": "100", "topmost": "0", "show_avatars": "1", "show_bars": "1",
-    "cols": "1", "anim": "0", "sidebar_small": "0",
+    "cols": "1", "anim": "1", "sidebar_small": "0",
     # general / launch / recovery
     "start_min": "0", "autostart": "0", "delay": "8", "default_dest": "",
     "auto": "0", "max_attempts": "3", "restart_delay": "15", "multi": "1",
     # performance
-    "preset": "lowest", "interval": "5", "monitor": "0",
+    "preset": "smooth", "interval": "3", "monitor": "0",
     "c_prio": "Normal", "c_w": "0", "c_h": "0", "c_automin": "0",
     "p_eco": "0", "p_cores": "0", "p_bg": "0", "p_trim": "0", "p_mem": "0",
     "p_gpu": "default", "p_gfx": "0", "p_fps": "0", "p_gpucap": "0", "p_ramcap": "0",
-    "isolate": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
-    "ui_iv": "3", "ui_pause": "1", "self_eco": "1", "self_eco_always": "1", "prev_on": "0", "prev_iv": "5",
+    "isolate": "0", "app_cap": "15", "ram_guard": "1", "relax_on": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
+    "ui_iv": "1", "ui_pause": "1", "self_eco": "1", "self_eco_always": "0", "prev_on": "0", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
     "lock_hash": "",
@@ -154,6 +155,14 @@ MIGRATIONS = [
        ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
     """BEGIN; INSERT INTO settings(key,value) VALUES('p_ramcap','100')
        ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES
+      ('theme','Obsidian'),('radius','18'),('anim','1'),('ui_iv','1'),('self_eco_always','0'),('isolate','0'),
+      ('p_ramcap','150'),('app_cap','20'),('ram_guard','1'),('relax_on','1'),('prev_on','0')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES('app_cap','15'),('p_ramcap','200')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
+    """BEGIN; INSERT INTO settings(key,value) VALUES('preset','smooth'),('interval','3')
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;""",
 ]
 
 
@@ -177,6 +186,9 @@ class DB:
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA foreign_keys=ON")
+            c.execute("PRAGMA synchronous=NORMAL")  # fewer forced disk flushes
+            c.execute("PRAGMA temp_store=MEMORY")
+            c.execute("PRAGMA cache_size=-4000")
             return c
 
         try:
@@ -510,7 +522,7 @@ def login_window():
             win.events.loaded += fill
 
         def watch():
-            logged_since = None
+            logged_since, last_err = None, ""
             while True:
                 time.sleep(1.5)
                 try:
@@ -521,15 +533,20 @@ def login_window():
                                 base.with_suffix(".out").write_bytes(dpapi_protect(val.encode()))
                                 win.destroy()
                                 return
-                    url = win.get_current_url() or ""
-                    if any(x in url for x in ("/home", "/games", "/discover")):
-                        logged_since = logged_since or time.time()
-                        if time.time() - logged_since > 15:
-                            fail("You are logged in, but the login window did not expose the session. Use Import cookie instead.")
-                            win.destroy()
-                            return
-                except Exception:
-                    continue
+                except Exception as e:
+                    last_err = f"cookies: {e}"
+                url = ""
+                try:
+                    url = win.get_current_url() or win.evaluate_js("location.href") or ""
+                except Exception as e:
+                    last_err = f"url: {e}"
+                if any(x in url for x in ("/home", "/games", "/discover", "/charts")):
+                    logged_since = logged_since or time.time()
+                    if time.time() - logged_since > 15:
+                        fail("You are logged in, but the login window did not expose the session cookie"
+                             + (f" ({last_err})" if last_err else "") + ". Use Import cookie instead.")
+                        win.destroy()
+                        return
 
         webview.start(watch, private_mode=True)
     except ModuleNotFoundError as e:
@@ -548,8 +565,9 @@ def browser_login(user=None, pw=None):
     try:
         if user and pw:
             base.with_suffix(".in").write_bytes(dpapi_protect(json.dumps({"u": user, "p": pw}).encode()))
-        subprocess.run(cmd, timeout=900, creationflags=0x08000000, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, creationflags=0x08000000, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.wait()  # no time limit: it ends when you finish logging in or close the window
         out, err = base.with_suffix(".out"), base.with_suffix(".err")
         if out.exists():
             return dpapi_unprotect(out.read_bytes()).decode()
@@ -662,7 +680,13 @@ PRESET_DEFS = {
     "minimal": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
                     bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=15, cpucap=10, interval=5),
     "lowest": dict(prio="Below normal", size=(320, 180), automin=True, eco=True, cores=1,
-                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, ramcap=100, interval=5),
+                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, ramcap=200, interval=5),
+    # Lowest resources that still run smoothly: the CPU ceiling follows each client's real need (never squeezing it),
+    # windows shrink only when the GPU is busy, FPS is capped at 45, graphics at the floor, and nothing is forced
+    # out of RAM (swapping is what makes games stutter).
+    "smooth": dict(prio="Normal", size=(480, 270), automin=False, eco=False, cores=0, bgthrottle=False,
+                   trim=False, memprio=False, gpu="power", gfx=1, fps=45, cpucap=25, gpucap=12, gpumin=0.5,
+                   ramcap=0, auto=True, capfloor=8, interval=3),
 }
 
 
@@ -716,7 +740,7 @@ def os_trim(pid):
 
 
 def os_set_ramcap(pid, mb):
-    """Hard working-set limit (documented SetProcessWorkingSetSizeEx). Windows keeps at most `mb` MB of the
+    """Hard working-set ceiling (documented SetProcessWorkingSetSizeEx): Windows keeps at most `mb` MB of the
     process in physical RAM and pages the rest out. 0 lifts the limit."""
     h = _handle(pid, 0x0100 | 0x0400)  # PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION
     if not h:
@@ -755,6 +779,49 @@ def os_set_cap(c, pct):
     return bool(kernel32.SetInformationJobObject(c["job"], 15, ctypes.byref(info), ctypes.sizeof(info)))
 
 
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                                                   "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class JOB_BASIC_LIMIT(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+
+class JOB_EXT_LIMIT(ctypes.Structure):
+    _fields_ = [("Basic", JOB_BASIC_LIMIT), ("Io", IO_COUNTERS), ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+_SELF_JOB = None
+
+
+def set_self_cap(pct):
+    """Hard CPU ceiling for RoManager itself (percent of total CPU, 0 = none). SILENT_BREAKAWAY_OK keeps the
+    Roblox clients and the login window out of this job, so they are not squeezed by it."""
+    global _SELF_JOB
+    try:
+        if _SELF_JOB is None:
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return False
+            ext = JOB_EXT_LIMIT()
+            ext.Basic.LimitFlags = 0x1000  # JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(ext), ctypes.sizeof(ext)) or \
+                    not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+                kernel32.CloseHandle(job)
+                return False
+            _SELF_JOB = job
+        info = JOB_CPU_RATE((0x1 | 0x4) if pct > 0 else 0, int(pct * 100) if pct > 0 else 0)
+        return bool(kernel32.SetInformationJobObject(_SELF_JOB, 15, ctypes.byref(info), ctypes.sizeof(info)))
+    except Exception:
+        return False
+
+
 class PDH_VALUE(ctypes.Structure):
     _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
 
@@ -770,6 +837,7 @@ pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
 pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
                                              ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+pdh.PdhGetFormattedCounterValue.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 
 
 def gpu_usage_by_pid():
@@ -808,6 +876,31 @@ def gpu_usage_by_pid():
         pdh.PdhCloseQuery(q)
 
 
+class SysMeter:
+    """System-wide disk busy % and memory pages/sec (Windows performance counters, read once per sample)."""
+
+    def __init__(self):
+        self.q, self.cd, self.cp, self.ok = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p(), False
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.q)) == 0:
+            a = pdh.PdhAddEnglishCounterW(self.q, r"\PhysicalDisk(_Total)\% Disk Time", 0, ctypes.byref(self.cd))
+            b = pdh.PdhAddEnglishCounterW(self.q, r"\Memory\Pages/sec", 0, ctypes.byref(self.cp))
+            self.ok = a == 0 and b == 0
+            if self.ok:
+                pdh.PdhCollectQueryData(self.q)
+
+    def read(self):
+        if not self.ok:
+            return None
+        pdh.PdhCollectQueryData(self.q)
+        out = []
+        for c in (self.cd, self.cp):
+            v = PDH_VALUE()
+            if pdh.PdhGetFormattedCounterValue(c, 0x200, None, ctypes.byref(v)) != 0 or v.CStatus not in (0, 1):
+                return None
+            out.append(v.doubleValue)
+        return out[0], out[1]
+
+
 def roblox_exes():
     roots = [Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "Versions",
              Path(os.environ.get("ProgramFiles(x86)", "")) / "Roblox" / "Versions"]
@@ -836,6 +929,8 @@ class Core:
         self.attempts = {}
         self.failed = 0
         self.mutex = None
+        self.ram_lifted, self.relax, self.ram_extra = False, 0, 0
+        self.meter, self.disk_hot, self.disk_cool, self.disk_pct, self.pages_s = None, 0, 0, 0.0, 0.0
         self.holder = None
         self.multi_status = "Multi-instance is off."
         self.last_net = None
@@ -855,8 +950,7 @@ class Core:
         psutil.cpu_percent(None)
         threading.Thread(target=self.sample_loop, daemon=True).start()
         threading.Thread(target=self.gpu_loop, daemon=True).start()
-        if self.db.flag("multi"):
-            self.log(self.set_multi(True))
+        self.log(self.set_multi(True))
 
     def shutdown(self):
         self.stop = True
@@ -1038,7 +1132,7 @@ class Core:
         threading.Thread(target=self._queue, args=(list(ids), dest, delay), daemon=True).start()
 
     def _queue(self, ids, dest, delay):
-        if self.db.flag("multi") and not self.mutex:
+        if not self.mutex:
             self.log(self.set_multi(True))
         self.apply_global_perf()
         for i, aid in enumerate(ids):
@@ -1117,8 +1211,8 @@ class Core:
         if not c or not c["hwnd"]:
             self.log("Window not found for that client.")
             return
-        if c.get("embedded"):
-            self.log(f"{c['name']}: window is inside Multi-View. Use its own buttons or pop it out first.")
+        if c.get("embedded") or c.get("mv"):
+            self.log(f"{c['name']}: Multi-View is managing this window. Use its buttons there, or leave the tab.")
             return
         {"min": lambda h: win_show(h, 6), "max": lambda h: win_show(h, 3),
          "restore": lambda h: win_show(h, 9), "focus": win_focus}[cmd](c["hwnd"])
@@ -1130,12 +1224,12 @@ class Core:
     def resize(self, pid, w, h):
         with self.lock:
             c = self.clients.get(pid)
-        if c and c["hwnd"] and not c.get("embedded"):
+        if c and c["hwnd"] and not (c.get("embedded") or c.get("mv")):
             x, y, _, _ = win_rect(c["hwnd"])
             win_place(c["hwnd"], x, y, w, h)
 
     def arrange(self, mode):
-        cl = [c for c in self.snapshot() if c["hwnd"] and not c.get("embedded")]
+        cl = [c for c in self.snapshot() if c["hwnd"] and not (c.get("embedded") or c.get("mv"))]
         if not cl:
             self.log("No client windows to arrange.")
             return
@@ -1155,7 +1249,7 @@ class Core:
             win_place(c["hwnd"], x + k * cw, y + r * ch, cw, ch)
 
     def save_layout(self, name):
-        data = {str(c["account_id"]): win_rect(c["hwnd"]) for c in self.snapshot() if c["hwnd"] and not c.get("embedded")}
+        data = {str(c["account_id"]): win_rect(c["hwnd"]) for c in self.snapshot() if c["hwnd"] and not (c.get("embedded") or c.get("mv"))}
         self.db.q("INSERT INTO layouts(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
                   (name, json.dumps(data)))
 
@@ -1171,7 +1265,7 @@ class Core:
         maxy = max(m[1] + m[3] for m in mons)
         for c in self.snapshot():
             r = data.get(str(c["account_id"]))
-            if r and c["hwnd"] and not c.get("embedded"):
+            if r and c["hwnd"] and not (c.get("embedded") or c.get("mv")):
                 x, y, w, h = r  # clamp so a layout saved on another monitor setup stays on-screen
                 x = max(minx, min(x, maxx - 100))
                 y = max(miny, min(y, maxy - 100))
@@ -1195,6 +1289,21 @@ class Core:
                      ramcap=self.db.num("p_ramcap", 0, 8000), interval=None)
         d.setdefault("gpucap", 0)
         d.setdefault("ramcap", 0)
+        d.setdefault("gpumin", 0.03)
+        d.setdefault("auto", False)
+        d.setdefault("capfloor", 5)
+        if d["ramcap"] and self.ram_extra:
+            d["ramcap"] += self.ram_extra
+        if self.ram_lifted:
+            d["ramcap"] = 0
+        if self.relax >= 1:  # a client crashed under the limits: ease them step by step
+            d["ramcap"] = 0
+            d["cpucap"] = 0 if (self.relax >= 2 or not d["cpucap"]) else min(100, d["cpucap"] * 3)
+        if self.relax >= 2:
+            d["auto"] = False
+        if self.relax >= 3:
+            d["gpucap"] = 0
+            d["automin"] = False
         d["prio_class"] = PRIO.get(d["prio"], psutil.NORMAL_PRIORITY_CLASS)
         d["interval"] = max(d["interval"], iv) if d["interval"] else iv
         return d
@@ -1204,15 +1313,41 @@ class Core:
             c["denied"].add(what)
             self.log(f"{c['name']}: Windows or Roblox did not allow '{what}' for PID {c['pid']} (skipped).", "warn")
 
+    def auto_cap(self, c, pr):
+        """Finds the lowest CPU ceiling that does not squeeze the client. Usage close to the ceiling means the client is
+        being starved (that is what stutter is), so the ceiling jumps up at once; if usage stays well below it for a few
+        checks, the ceiling comes down to just above what the client really needs. New clients load at full speed."""
+        cap = c.get("cap_now") or pr["cpucap"]
+        use = c["cpu"]
+        new = cap
+        if time.time() - c["start"] < 45:
+            new = 100
+        elif use >= cap * 0.85:
+            c["calm"] = 0
+            new = min(100, max(cap * 3, use * 4))
+        elif use < cap * 0.55:
+            c["calm"] = c.get("calm", 0) + 1
+            if c["calm"] >= 3:
+                c["calm"] = 0
+                new = max(pr["capfloor"], use * 1.5)
+        else:
+            c["calm"] = 0
+        c["cap_now"] = round(new, 1) if abs(new - cap) >= 2 else round(cap, 1)
+
     def tune(self, c, pr, fg, idx):
-        bg = bool(c["hwnd"]) and c["hwnd"] != fg
+        bg = bool(c["hwnd"]) and c["hwnd"] != fg and not c.get("embedded")  # the client you are playing is never throttled
         prio = pr["prio_class"]
         if bg and pr["bgthrottle"] and prio == psutil.NORMAL_PRIORITY_CLASS:
             prio = psutil.BELOW_NORMAL_PRIORITY_CLASS
         eco = bool(pr["eco"] or (bg and pr["bgthrottle"]))
         now = time.time()
-        do_trim = bg and pr["trim"] and now - c["last_trim"] > 60
-        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), pr["cpucap"], pr["ramcap"])
+        do_trim = bg and pr["trim"] and not pr["ramcap"] and now - c["last_trim"] > 60
+        if pr["auto"]:
+            self.auto_cap(c, pr)
+            cap = int(c.get("cap_now") or pr["cpucap"])
+        else:
+            cap = pr["cpucap"]
+        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), cap, pr["ramcap"])
         if c["tuned"] == state and not do_trim:
             return
         pid = c["pid"]
@@ -1236,10 +1371,10 @@ class Core:
                     c["ram_set"] = pr["ramcap"] > 0
                 elif pr["ramcap"]:
                     self._deny(c, "RAM limit")
-            if pr["cpucap"] or c.get("cap_set"):
-                if os_set_cap(c, pr["cpucap"]):
-                    c["cap_set"] = pr["cpucap"] > 0
-                elif pr["cpucap"]:
+            if cap or c.get("cap_set"):
+                if os_set_cap(c, cap):
+                    c["cap_set"] = cap > 0
+                elif cap:
                     self._deny(c, "CPU usage cap")
             if pr["cores"] > 0 or c.get("aff_set"):
                 n = pr["cores"] or NCPU
@@ -1249,7 +1384,7 @@ class Core:
                     c["aff_set"] = pr["cores"] > 0
                 except (psutil.Error, OSError, ValueError):
                     self._deny(c, "CPU core limit")
-            if pr["size"] and c["hwnd"] and not c.get("embedded") and c["sized"] != pr["size"]:
+            if pr["size"] and c["hwnd"] and not (c.get("embedded") or c.get("mv")) and c["sized"] != pr["size"]:
                 x, y, _, _ = win_rect(c["hwnd"])
                 win_place(c["hwnd"], x, y, *pr["size"])
                 c["sized"] = pr["size"]
@@ -1271,7 +1406,7 @@ class Core:
                 self.log(f"Tuning error for PID {c['pid']}: {e}")
         if pr["automin"]:
             for c in cl:
-                if c["hwnd"] and not c.get("embedded") and c["hwnd"] != fg and not user32.IsIconic(c["hwnd"]):
+                if c["hwnd"] and not (c.get("embedded") or c.get("mv")) and c["hwnd"] != fg and not user32.IsIconic(c["hwnd"]):
                     win_show(c["hwnd"], 6)
 
     def apply_when_ready(self, pid):
@@ -1288,6 +1423,7 @@ class Core:
         self.tune_all()
 
     def apply_all(self):
+        self.relax, self.ram_lifted, self.disk_hot, self.ram_extra = 0, False, 0, 0
         for c in self.snapshot():
             c["tuned"] = None
             c["sized"] = None
@@ -1411,7 +1547,7 @@ class Core:
             base = tuple(pr["size"]) if pr["size"] else c.setdefault("gbase", tuple(win_rect(h)[2:]))
             sc = c.get("gscale", 1.0)
             if g > target * 1.15:
-                sc = max(0.03, sc * 0.8)
+                sc = max(pr.get("gpumin", 0.03), sc * 0.8)
             elif g < target * 0.5 and sc < 1.0:
                 sc = min(1.0, sc * 1.15)
             else:
@@ -1460,6 +1596,32 @@ class Core:
                 self._check_hung(c)
             except psutil.NoSuchProcess:
                 self.on_exit(c["pid"])
+        if self.db.flag("ram_guard") and any(c.get("ram_set") for c in cl):
+            if self.meter is None:
+                self.meter = SysMeter()
+            r = self.meter.read()
+            if r:
+                self.disk_pct, self.pages_s = r
+                if r[0] > 2.0 and r[1] > 15:  # disk busy above 2% because Windows is swapping the clients
+                    self.disk_hot, self.disk_cool = self.disk_hot + 1, 0
+                elif r[0] < 1.0 and r[1] < 5:
+                    self.disk_cool, self.disk_hot = self.disk_cool + 1, 0
+                else:
+                    self.disk_hot = self.disk_cool = 0
+                if self.disk_hot >= 2:
+                    self.disk_hot = 0
+                    self.ram_extra += 50
+                    cap = self.profile()["ramcap"]
+                    if not cap or cap >= 1500:
+                        self.ram_lifted = True
+                        self.log("Swapping kept the disk busy even with a big allowance, so the RAM limit was lifted.", "bad")
+                    else:
+                        self.log(f"Disk was {r[0]:.0f}% busy because Windows was swapping the clients. "
+                                 f"RAM allowance raised to {cap} MB to bring the disk back under 2%.", "warn")
+                elif self.disk_cool >= 12 and self.ram_extra > 0:  # about a minute of calm: tighten again
+                    self.ram_extra, self.disk_cool = max(0, self.ram_extra - 25), 0
+        else:
+            self.disk_hot = self.disk_cool = 0
         self.hist.append({"t": now, "cpu": psutil.cpu_percent(None), "ram_pct": vm.percent,
                           "ram_used": vm.used, "ram_avail": vm.available, "total": vm.total,
                           "rb_cpu": rb_cpu, "rb_ram": rb_ram, "up": up, "down": down, "per": per,
@@ -1475,10 +1637,22 @@ class Core:
         if c["hung"] >= 3 and not c.get("hung_notified"):
             c["hung_notified"] = True
             self.log(f"{c['name']}: client is not responding", "warn")
+            if self.limited(c):
+                self._relax(f"{c['name']} stopped responding under the limits.")
             self.notify("hung", f"{c['name']}: Roblox client (PID {c['pid']}) is not responding.")
             if self.db.flag("auto"):
                 self.log(f"{c['name']}: terminating unresponsive client for recovery")
                 self.close_client(c["pid"], expected=False)
+
+    def limited(self, c):
+        return bool(c.get("cap_set") or c.get("ram_set") or c.get("aff_set") or c.get("eco_set"))
+
+    def _relax(self, why):
+        if not self.db.flag("relax_on") or self.relax >= 3:
+            return
+        self.relax += 1
+        self.log(f"{why} RoManager eased the limits (step {self.relax}/3) so clients are less likely to crash. "
+                 "Performance → Apply and save puts your own limits back.", "warn")
 
     def on_exit(self, pid):
         with self.lock:
@@ -1491,6 +1665,8 @@ class Core:
             return
         self.failed += 1
         self.log(f"{c['name']}: client exited unexpectedly (PID {pid})", "bad")
+        if time.time() - c["start"] < 900 and self.limited(c):
+            self._relax(f"{c['name']} crashed under the limits.")
         self.notify("crash", f"{c['name']}: Roblox client (PID {pid}) exited unexpectedly.")
         if not self.db.flag("auto"):
             return
@@ -1530,6 +1706,8 @@ except Exception:
     ImageDraw = None
 
 THEMES = {
+    "Obsidian": dict(mode="dark", bg="#07080c", side="#0b0d13", panel="#10131b", panel2="#171b26", border="#222838", text="#eef1f8", muted="#8a93a8", accent="#7c8bff"),
+    "Frost": dict(mode="light", bg="#e9edf5", side="#f6f8fc", panel="#ffffff", panel2="#eef2f9", border="#d9e0ee", text="#121722", muted="#66708a", accent="#5b6cff"),
     "Midnight": dict(mode="dark", bg="#0a0c11", side="#0e1117", panel="#131720", panel2="#1a202b", border="#222a38", text="#e8ecf4", muted="#8791a7", accent="#5b8cff"),
     "Aurora": dict(mode="dark", bg="#07100f", side="#0a1514", panel="#0f1c1b", panel2="#152826", border="#1d3532", text="#e6f5f2", muted="#7fa39d", accent="#2dd4bf"),
     "Crimson": dict(mode="dark", bg="#0e0a0b", side="#140e10", panel="#1b1214", panel2="#251a1d", border="#3a2529", text="#f5e9eb", muted="#a58a90", accent="#f43f5e"),
@@ -1611,6 +1789,42 @@ user32.IsChild.argtypes = [V, V]
 user32.GetAncestor.restype = V
 user32.GetAncestor.argtypes = [V, wintypes.UINT]
 user32.GetForegroundWindow.restype = V
+user32.ClientToScreen.argtypes = [V, ctypes.POINTER(POINT)]
+dwmapi = ctypes.windll.dwmapi
+dwmapi.DwmRegisterThumbnail.argtypes = [V, V, ctypes.POINTER(ctypes.c_void_p)]
+dwmapi.DwmUpdateThumbnailProperties.argtypes = [ctypes.c_void_p, V]
+dwmapi.DwmUnregisterThumbnail.argtypes = [ctypes.c_void_p]
+dwmapi.DwmQueryThumbnailSourceSize.argtypes = [ctypes.c_void_p, V]
+dwmapi.DwmSetWindowAttribute.argtypes = [V, wintypes.DWORD, V, wintypes.DWORD]
+
+
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+    _fields_ = [("dwFlags", wintypes.DWORD), ("rcDestination", wintypes.RECT), ("rcSource", wintypes.RECT),
+                ("opacity", ctypes.c_ubyte), ("fVisible", wintypes.BOOL), ("fSourceClientAreaOnly", wintypes.BOOL)]
+
+
+def style_window(win):
+    """Windows 11 look: dark title bar tinted like the app, rounded corners (ignored on older Windows)."""
+    try:
+        win.update_idletasks()
+        hwnd = user32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+
+        def put(attr, val):
+            v = ctypes.c_int(val)
+            dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), 4)
+
+        put(20, 1 if T["mode"] == "dark" else 0)
+        r, g, b = hexrgb(T["bg"])
+        put(35, r | (g << 8) | (b << 16))
+        r, g, b = hexrgb(T["text"])
+        put(36, r | (g << 8) | (b << 16))
+        put(33, 2)
+    except Exception:
+        pass
 
 
 def hexrgb(h):
@@ -1651,6 +1865,25 @@ ctk.CTkLabel.configure = _lazy_label_cfg
 ctk.CTkProgressBar.set = _lazy_bar_set
 
 
+_FONTS = {}
+
+
+def _has_font(prefix):
+    if prefix not in _FONTS:
+        ok = False
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts") as k:
+                i = 0
+                while not ok:
+                    ok = winreg.EnumValue(k, i)[0].startswith(prefix)
+                    i += 1
+        except OSError:
+            pass
+        _FONTS[prefix] = ok
+    return _FONTS[prefix]
+
+
 def apply_theme(db):
     global FONT_FAMILY, R, PAD
     T.clear()
@@ -1660,7 +1893,10 @@ def apply_theme(db):
         T["accent"] = acc
     R = db.num("radius", 0, 24)
     PAD = 6 if db.get("density") == "Compact" else 11
-    FONT_FAMILY = db.get("font") or "Segoe UI"
+    fam = db.get("font") or "Segoe UI"
+    if fam == "Segoe UI" and _has_font("Segoe UI Variable"):
+        fam = "Segoe UI Variable Text"  # the Windows 11 / 2026 system font
+    FONT_FAMILY = fam
     ctk.set_appearance_mode(T["mode"])
 
 
@@ -1760,6 +1996,7 @@ def dialog(app, title, w, h):
             pass
 
     top.after(250, grab)
+    top.after(80, lambda: style_window(top))
     return top
 
 
@@ -1895,6 +2132,7 @@ class Page(ctk.CTkFrame):
         left.pack(side="left")
         L(left, title, 26, True).pack(anchor="w")
         L(left, sub, 13, muted=True).pack(anchor="w")
+        ctk.CTkFrame(left, height=3, width=38, fg_color=T["accent"], corner_radius=2).pack(anchor="w", pady=(7, 0))
         self.actions = ctk.CTkFrame(head, fg_color="transparent")
         self.actions.pack(side="right")
 
@@ -1922,7 +2160,8 @@ class HomePage(Page):
             f.grid(row=0, column=i, sticky="nsew", padx=4)
             top = ctk.CTkFrame(f, fg_color="transparent")
             top.pack(fill="x", padx=14, pady=(12, 0))
-            L(top, ic, 14, color=T["accent"]).pack(side="left")
+            ctk.CTkLabel(top, text=ic, width=30, height=30, corner_radius=9, fg_color=blend(T["accent"], T["panel"], .16),
+                         text_color=T["accent"], font=F(14, True)).pack(side="left")
             L(top, "  " + t, 12, muted=True).pack(side="left")
             val = L(f, "-", 26, True)
             val.pack(anchor="w", padx=14)
@@ -2070,7 +2309,8 @@ class HomePage(Page):
                 txt, col = "Running", OK
             k["pill"].configure(text=f" {txt} ", text_color=col, fg_color=blend(col, T["panel"], .16))
             k["game"].configure(text=f"Place {dest_label(c['dest'])}")
-            k["meta"].configure(text=f"PID {c['pid']}   ·   up {fmt_dur(time.time() - c['start'])}   ·   window: {state.lower()}")
+            capn = f"   ·   CPU cap {int(c['cap_now'])}%" if c.get("cap_now") else ""
+            k["meta"].configure(text=f"PID {c['pid']}   ·   up {fmt_dur(time.time() - c['start'])}   ·   window: {state.lower()}{capn}")
             if "cpu" in k["bars"]:
                 k["bars"]["cpu"][0].set(min(1, c["cpu"] * 4 / 100))
                 k["bars"]["cpu"][1].configure(text=f"{c['cpu']:.1f}%")
@@ -2510,10 +2750,6 @@ class PlayPage(Page):
         r = ctk.CTkFrame(pad, fg_color="transparent")
         r.pack(fill="x")
         btn(r, "★ Save favourite", self.fav, "ghost", w=130).pack(side="left")
-        self.multi = SW(r, "Multi-instance", command=self.toggle_multi)
-        self.multi.pack(side="right")
-        if self.core.mutex:
-            self.multi.select()
         r2 = ctk.CTkFrame(pad, fg_color="transparent")
         r2.pack(fill="x", pady=(6, 0))
         self.iso = SW(r2, "Isolated sessions (recommended when running several accounts)",
@@ -2523,6 +2759,7 @@ class PlayPage(Page):
         self.iso.pack(side="left")
         self.multi_lbl = L(pad, "", 11, muted=True, justify="left", wraplength=520)
         self.multi_lbl.pack(anchor="w", pady=(4, 0))
+        self.fix = btn(pad, "Fix: close Roblox and retry", self.fix_multi, "ghost", w=230, h=30)
         d0 = max(0, min(120, int(float(self.core.db.get("delay") or 8))))
         self.delay = slider_row(pad, "Delay between launches", 0, 120, 120, d0, lambda v: f"{int(v)} s")
         self.sel = L(pad, "", 12, muted=True, justify="left", wraplength=520)
@@ -2573,25 +2810,15 @@ class PlayPage(Page):
         except ValueError as e:
             self.prev.configure(text="✗ " + str(e), text_color=BAD)
 
-    def toggle_multi(self):
-        on = bool(self.multi.get())
-        self.core.db.set("multi", "1" if on else "0")
-        m = self.core.set_multi(on)
-        self.core.log(m)
-        if on and not self.core.mutex:
-            if roblox_pids() and messagebox.askyesno(APP_NAME, m + "\n\nClose all running Roblox windows now and try again?"):
-                for p in roblox_pids():
-                    try:
-                        psutil.Process(p).terminate()
-                    except psutil.Error:
-                        pass
-                time.sleep(2)
-                m = self.core.set_multi(True)
-                self.core.log(m)
-            if not self.core.mutex:
-                self.multi.deselect()
-                self.core.db.set("multi", "0")
-                messagebox.showwarning(APP_NAME, m)
+    def fix_multi(self):
+        if roblox_pids() and messagebox.askyesno(APP_NAME, self.core.multi_status + "\n\nClose all running Roblox windows now and try again?"):
+            for p in roblox_pids():
+                try:
+                    psutil.Process(p).terminate()
+                except psutil.Error:
+                    pass
+            time.sleep(2)
+        self.core.log(self.core.set_multi(True))
 
     def fav(self):
         try:
@@ -2634,6 +2861,10 @@ class PlayPage(Page):
 
     def refresh(self):
         self.multi_lbl.configure(text=self.core.multi_status, text_color=OK if self.core.mutex else WARN)
+        if self.core.mutex:
+            self.fix.pack_forget()
+        elif not self.fix.winfo_ismapped():
+            self.fix.pack(anchor="w", pady=(4, 0))
         names = [(r["alias"] or r["username"]) for r in self.core.db.all("SELECT username, alias, id FROM accounts") if r["id"] in self.app.selected]
         self.sel.configure(text=f"Launching with {len(names)} account(s): " + (", ".join(names[:8]) + ("…" if len(names) > 8 else "") if names else "none selected yet"))
         q = self.core.qs
@@ -2694,7 +2925,6 @@ class WindowsPage(Page):
         self.mon = OM(bar, self.mon_names, width=210, command=self.pick_mon)
         self.mon.set(self.mon_names[min(self.core.db.num("monitor", 0, 16), len(mons) - 1)])
         self.mon.pack(side="left")
-        btn(bar, "⟳ Previews", lambda: self.last_cap.clear(), "ghost", w=100, h=36).pack(side="right")
         self.count = L(self, "", 12, muted=True)
         self.count.pack(anchor="w", pady=(0, 4))
         self.list = ctk.CTkScrollableFrame(self, fg_color="transparent")
@@ -2710,23 +2940,20 @@ class WindowsPage(Page):
             messagebox.showerror(APP_NAME, "Enter a width and a height (any positive numbers).")
             return
         for c in self.core.snapshot():
-            if c["hwnd"] and not c.get("embedded"):
+            if c["hwnd"] and not (c.get("embedded") or c.get("mv")):
                 x, y, _, _ = win_rect(c["hwnd"])
                 win_place(c["hwnd"], x, y, *wh)
 
     def cascade(self):
         mons = monitors()
         x, y, w, h = mons[min(self.core.db.num("monitor", 0, 16), len(mons) - 1)]
-        for i, c in enumerate([c for c in self.core.snapshot() if c["hwnd"] and not c.get("embedded")]):
+        for i, c in enumerate([c for c in self.core.snapshot() if c["hwnd"] and not (c.get("embedded") or c.get("mv"))]):
             win_place(c["hwnd"], x + 32 * i, y + 32 * i, int(w * 0.55), int(h * 0.55))
 
     def make_tile(self, c):
         f = card(self.list)
-        prev = ctk.CTkLabel(f, text="Preview loading…", width=300, height=170, corner_radius=max(R - 4, 4),
-                            fg_color=T["panel2"], text_color=T["muted"], font=F(12))
-        prev.pack(padx=12, pady=(12, 6))
         head = ctk.CTkFrame(f, fg_color="transparent")
-        head.pack(fill="x", padx=14)
+        head.pack(fill="x", padx=14, pady=(12, 0))
         L(head, c["name"], 14, True).pack(side="left")
         pl = pill(head, "Running", OK)
         pl.pack(side="right")
@@ -2735,7 +2962,7 @@ class WindowsPage(Page):
         r1 = ctk.CTkFrame(f, fg_color="transparent")
         r1.pack(fill="x", padx=12)
         pid = c["pid"]
-        t = {"frame": f, "prev": prev, "pill": pl, "info": info, "img": None, "pinned": False}
+        t = {"frame": f, "prev": None, "pill": pl, "info": info, "img": None, "pinned": False}
         for txt, cmd in [("Focus", lambda: self.core.window_cmd(pid, "focus")), ("Min", lambda: self.core.window_cmd(pid, "min")),
                          ("Max", lambda: self.core.window_cmd(pid, "max")), ("Restore", lambda: self.core.window_cmd(pid, "restore"))]:
             btn(r1, txt, cmd, "ghost", h=28).pack(side="left", padx=(0, 4))
@@ -2788,7 +3015,7 @@ class WindowsPage(Page):
     def pin(self, pid):
         c = next((c for c in self.core.snapshot() if c["pid"] == pid), None)
         t = self.tiles.get(pid)
-        if c and c["hwnd"] and t and not c.get("embedded"):
+        if c and c["hwnd"] and t and not (c.get("embedded") or c.get("mv")):
             t["pinned"] = not t["pinned"]
             user32.SetWindowPos(c["hwnd"], V(-1 if t["pinned"] else -2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
             t["pin"].configure(text="Unpin" if t["pinned"] else "Pin", width=56 if t["pinned"] else 46)
@@ -2837,255 +3064,333 @@ class WindowsPage(Page):
             elif c["hwnd"]:
                 x, y, w, h = win_rect(c["hwnd"])
                 t["info"].configure(text=f"PID {c['pid']}   ·   {w}×{h} at ({x}, {y})")
-                if (c["pid"] not in self.capturing and self.core.db.flag("prev_on")
-                        and time.time() - self.last_cap.get(c["pid"], 0) > self.core.db.num("prev_iv", 2, 60)
-                        and state in ("Normal", "Maximized")):
-                    self.capturing.add(c["pid"])
-                    self.app.bg(lambda hw=c["hwnd"]: capture(hw), lambda img, err, p=c["pid"]: self._got(p, img))
             else:
                 t["info"].configure(text=f"PID {c['pid']}   ·   waiting for window…")
 
 
 # ------------------------------------------------------------ Multi-View ---
 class MultiViewPage(Page):
-    PRESETS = [("Tiny", 160, 90), ("Small", 320, 180), ("Medium", 480, 270), ("Large", 640, 360)]
+    """Grid of live previews drawn by Windows' own compositor (DWM): the whole window, scaled, GPU-composed,
+    no screen grabbing and no polling. Click one to open it on the stage, where you can play it normally."""
+    GAP, CAP = 12, 34
 
     def __init__(self, parent, app):
-        super().__init__(parent, app, "Multi-View", "Every Roblox client inside RoManager. Hover a window and play it normally.")
-        db = self.core.db
-        self.tiles, self.cols, self.order, self.active = {}, 0, None, False
-        self.tw, self.th = db.num("mv_w", 1, 4000), db.num("mv_h", 1, 4000)
-        self.pw, self.ph = db.num("mv_pw", 1, 4000), db.num("mv_ph", 1, 4000)
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x", pady=(0, PAD))
-        g = card(bar)
-        g.pack(side="left", padx=(0, 8))
-        i1 = ctk.CTkFrame(g, fg_color="transparent")
-        i1.pack(padx=10, pady=8)
-        L(i1, "Tile", 12, True).pack(side="left", padx=(0, 6))
-        self.ew = E(i1, width=64)
-        self.ew.pack(side="left", padx=2)
-        L(i1, "×", 13, muted=True).pack(side="left")
-        self.eh = E(i1, width=64)
-        self.eh.pack(side="left", padx=2)
-        L(i1, "Play size", 12, True).pack(side="left", padx=(14, 6))
-        self.ep = E(i1, width=64)
-        self.ep.pack(side="left", padx=2)
-        L(i1, "×", 13, muted=True).pack(side="left")
-        self.eq = E(i1, width=64)
-        self.eq.pack(side="left", padx=2)
-        for e, v in ((self.ew, self.tw), (self.eh, self.th), (self.ep, self.pw), (self.eq, self.ph)):
-            e.insert(0, str(v))
-        btn(i1, "Apply", self.apply_size, "accent", w=64, h=34).pack(side="left", padx=(8, 0))
-        g2 = card(bar)
-        g2.pack(side="left", padx=(0, 8))
-        i2 = ctk.CTkFrame(g2, fg_color="transparent")
-        i2.pack(padx=6, pady=6)
-        for name, w, h in self.PRESETS:
-            btn(i2, f"{name} {w}×{h}", lambda w=w, h=h: self.set_sizes(w, h, self.pw, self.ph), "flat", h=32).pack(side="left", padx=2)
-        btn(bar, "Release all", self.release_btn, "ghost", w=110, h=36).pack(side="right", padx=4)
-        btn(bar, "Embed all", self.embed_btn, "ghost", w=110, h=36).pack(side="right", padx=4)
-        L(self, "Tiles can be any size (even 1×1). Move the mouse over a window and use it normally: RoManager hands it the keyboard. "
-                "“Play” enlarges one client to the play size. Closing RoManager releases the windows first; a force-kill closes them. "
-                "If a game behaves oddly inside a tile, pop it out.",
-          11, muted=True, wraplength=1000, justify="left").pack(anchor="w", pady=(0, PAD))
-        self.host = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.host.pack(fill="both", expand=True)
-        self.empty = L(self.host, "No Roblox windows yet. Launch an account and it appears here.", 14, muted=True)
+        super().__init__(parent, app, "Multi-View", "Live previews of every client. Click one to play it.")
+        self.tiles, self.thumbs, self.orig = {}, {}, {}
+        self.stage_pid = self.stage_saved = None
+        self.active, self._job, self._order = False, None, None
+        self.back = btn(self.actions, "▦  Back to grid", self.unstage, "ghost", w=140, h=36)
+        btn(self.actions, "Show all on desktop", self.release_btn, "ghost", w=170, h=36).pack(side="left", padx=4)
+        self.area = ctk.CTkFrame(self, fg_color="transparent")
+        self.area.pack(fill="both", expand=True)
+        self.area.bind("<Configure>", lambda e: self.schedule())
+        self.stage = tk.Frame(self.area, bg="#05070a")
+        self.empty = L(self.area, "No Roblox windows yet. Launch an account and its live preview appears here.", 14, muted=True)
+        self.empty.place(relx=0.5, rely=0.45, anchor="center")
         self.after(500, self.follow)
+        self.after(1000, self.pulse)
 
-    def tile_size(self, t):
-        return (self.pw, self.ph) if t["big"] else (self.tw, self.th)
-
-    def apply_size(self):
-        a = parse_wh(f"{self.ew.get()}x{self.eh.get()}")
-        b = parse_wh(f"{self.ep.get()}x{self.eq.get()}")
-        if not a or not b or max(a + b) > 4000:
-            messagebox.showerror(APP_NAME, "Enter widths and heights between 1 and 4000.")
-            return
-        self.set_sizes(*a, *b)
-
-    def set_sizes(self, tw, th, pw, ph):
-        self.tw, self.th, self.pw, self.ph = tw, th, pw, ph
-        db = self.core.db
-        db.set("mv_w", tw)
-        db.set("mv_h", th)
-        db.set("mv_pw", pw)
-        db.set("mv_ph", ph)
-        for e, v in ((self.ew, tw), (self.eh, th), (self.ep, pw), (self.eq, ph)):
-            e.delete(0, "end")
-            e.insert(0, str(v))
-        for pid in self.tiles:
-            self.resize_tile(pid)
-
-    def resize_tile(self, pid):
-        t, c = self.tiles.get(pid), self.client(pid)
-        if not t:
-            return
-        w, h = self.tile_size(t)
-        t["view"].configure(width=w, height=h)
-        if c and c.get("embedded") and c["hwnd"]:
-            win_place(c["hwnd"], 0, 0, w, h)
-        self.order = None
+    def root(self):
+        return user32.GetAncestor(self.winfo_id(), 2)
 
     def client(self, pid):
         return next((c for c in self.core.snapshot() if c["pid"] == pid), None)
 
-    # -- embedding
-    def embed_one(self, c, t):
+    # ---- real windows: parked off-screen while previewed, put back afterwards
+    def park(self, c):
+        h = c["hwnd"]
+        if not h or c.get("embedded") or c.get("mv"):
+            return
+        if c["pid"] not in self.orig:
+            user32.ShowWindow(h, 9)
+            self.orig[c["pid"]] = win_rect(h)
+        c["mv"] = True
+        x, y, w, hh = win_rect(h)
+        if x > -10000:
+            win_place(h, -20000, -20000, max(w, 16), max(hh, 16))
+
+    def unpark(self, c):
+        c["mv"] = False
+        r = self.orig.pop(c["pid"], None)
+        if r and c["hwnd"] and user32.IsWindow(c["hwnd"]):
+            x, y, w, hh = r
+            win_place(c["hwnd"], x if x > -10000 else 100, y if y > -10000 else 100, w, hh)
+
+    # ---- DWM thumbnails
+    def thumb_for(self, c):
+        pid = c["pid"]
+        if pid in self.thumbs:
+            return self.thumbs[pid]
+        th = ctypes.c_void_p()
+        if dwmapi.DwmRegisterThumbnail(self.root(), c["hwnd"], ctypes.byref(th)) != 0 or not th.value:
+            return None
+        self.thumbs[pid] = th.value
+        return th.value
+
+    def drop_thumb(self, pid):
+        th = self.thumbs.pop(pid, None)
+        if th:
+            dwmapi.DwmUnregisterThumbnail(th)
+
+    def sync(self):
+        if not self.active:
+            return
+        origin = POINT(0, 0)
+        user32.ClientToScreen(self.root(), ctypes.byref(origin))
+        for pid, t in list(self.tiles.items()):
+            c = self.client(pid)
+            if not (c and c["hwnd"] and pid != self.stage_pid and t["frame"].winfo_ismapped() and user32.IsWindow(c["hwnd"])):
+                self.drop_thumb(pid)
+                continue
+            th = self.thumb_for(c)
+            if not th:
+                t["lab"].configure(text="Preview unavailable")
+                continue
+            sz = SIZE()
+            if dwmapi.DwmQueryThumbnailSourceSize(th, ctypes.byref(sz)) != 0 or sz.cx < 1 or sz.cy < 1:
+                self.drop_thumb(pid)
+                continue
+            v = t["view"]
+            vx, vy = v.winfo_rootx() - origin.x, v.winfo_rooty() - origin.y
+            vw, vh = max(1, v.winfo_width()), max(1, v.winfo_height())
+            sc = min(vw / sz.cx, vh / sz.cy)  # fit the WHOLE window inside the tile, keep its shape
+            dw, dh = max(1, int(sz.cx * sc)), max(1, int(sz.cy * sc))
+            x0, y0 = vx + (vw - dw) // 2, vy + (vh - dh) // 2
+            pr = DWM_THUMBNAIL_PROPERTIES()
+            pr.dwFlags = 0x1 | 0x8 | 0x10  # destination | visible | client area only
+            pr.rcDestination = wintypes.RECT(x0, y0, x0 + dw, y0 + dh)
+            pr.fVisible = True
+            pr.fSourceClientAreaOnly = True
+            if dwmapi.DwmUpdateThumbnailProperties(th, ctypes.byref(pr)) != 0:
+                self.drop_thumb(pid)
+            else:
+                t["lab"].configure(text="")
+
+    # ---- layout
+    def schedule(self):
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(50, self.layout)
+
+    def layout(self):
+        self._job = None
+        W, H = self.area.winfo_width(), self.area.winfo_height()
+        if W < 60 or H < 60:
+            return
+        G, CAP = self.GAP, self.CAP
+        order = [p for p in (self._order or []) if p in self.tiles]
+        stage = self.stage_pid if self.stage_pid in self.tiles else None
+        rects = {}
+        if stage:
+            others = [p for p in order if p != stage]
+            sw = W if not others else int(W * 0.76)
+            self.stage.place(x=0, y=0, width=sw, height=H)
+            c = self.client(stage)
+            if c and c.get("embedded") and c["hwnd"]:
+                win_place(c["hwnd"], 0, 0, sw, H)
+            if others:
+                x0, w = sw + G, W - sw - G
+                h = int(w * 9 / 16)
+                avail = H - G * (len(others) - 1)
+                if len(others) * (h + CAP) > avail:
+                    h = max(24, avail // len(others) - CAP)
+                    w = int(h * 16 / 9)
+                for i, p in enumerate(others):
+                    rects[p] = (x0, i * (h + CAP + G), w, h)
+        elif order:
+            self.stage.place_forget()
+            n, best = len(order), None
+            for cols in range(1, n + 1):
+                rows = math.ceil(n / cols)
+                w = (W - G * (cols - 1)) / cols
+                h = w * 9 / 16
+                if rows * (h + CAP) + G * (rows - 1) > H:
+                    h = (H - G * (rows - 1)) / rows - CAP
+                    w = h * 16 / 9
+                if best is None or w > best[0]:
+                    best = (w, h, cols)
+            w, h, cols = max(40, int(best[0])), max(24, int(best[1])), best[2]
+            ox = max(0, (W - (cols * w + (cols - 1) * G)) // 2)
+            for i, p in enumerate(order):
+                r, k = divmod(i, cols)
+                rects[p] = (ox + k * (w + G), r * (h + CAP + G), w, h)
+        else:
+            self.stage.place_forget()
+        for pid, t in self.tiles.items():
+            if pid in rects:
+                x, y, w, h = rects[pid]
+                t["frame"].place(x=x, y=y, width=w, height=h + CAP)
+                t["view"].place(x=3, y=3, width=max(1, w - 6), height=max(1, h - 3))
+                t["cap"].place(x=8, y=h + 2, width=max(1, w - 16), height=CAP - 6)
+            else:
+                t["frame"].place_forget()
+        self.update_idletasks()
+        self.sync()
+
+    # ---- stage (the one window you can play)
+    def play(self, pid):
+        c, t = self.client(pid), self.tiles.get(pid)
+        if not (c and t and c["hwnd"]) or self.stage_pid == pid:
+            return
+        self.unstage(redraw=False)
+        self.drop_thumb(pid)
+        self.park(c)
+        self.stage_pid = pid
+        self.back.pack(side="left", padx=4)
+        self.layout()
         try:
-            t["view"].update_idletasks()
-            w, h = self.tile_size(t)
-            t["saved"] = embed_window(c["hwnd"], t["view"].winfo_id(), w, h)
-            c["embedded"], t["popped"] = True, False
-            t["pop"].configure(text="Pop out")
+            self.stage.update_idletasks()
+            w, h = max(2, self.stage.winfo_width()), max(2, self.stage.winfo_height())
+            self.stage_saved = embed_window(c["hwnd"], self.stage.winfo_id(), w, h)
+            c["embedded"] = True
         except Exception as e:
-            t["failed"] = True
-            self.core.log(f"{c['name']}: could not embed the window ({e}).", "warn")
+            self.stage_pid = self.stage_saved = None
+            self.back.pack_forget()
+            self.app.toast(f"Could not open it on the stage: {e}", "bad")
+        self.schedule()
 
-    def release_one(self, c, t):
-        if c.get("embedded") and t.get("saved"):
-            release_window(c["hwnd"], t["saved"])
-        c["embedded"] = False
+    def unstage(self, redraw=True):
+        pid = self.stage_pid
+        if pid is None:
+            return
+        c = self.client(pid)
+        if c and c.get("embedded") and self.stage_saved:
+            release_window(c["hwnd"], self.stage_saved)
+        if c:
+            c["embedded"] = False
+        self.stage_pid = self.stage_saved = None
+        self.back.pack_forget()
+        self.stage.place_forget()
+        if redraw:
+            self.schedule()
 
-    def release_all(self):
-        for pid, t in self.tiles.items():
-            c = self.client(pid)
-            if c:
-                try:
-                    self.release_one(c, t)
-                except Exception:
-                    pass
-
-    def release_btn(self):
-        for pid, t in self.tiles.items():
-            c = self.client(pid)
-            if c:
-                self.release_one(c, t)
-                t["popped"] = True
-                t["pop"].configure(text="Embed back")
-
-    def embed_btn(self):
-        for t in self.tiles.values():
-            t["popped"], t["failed"] = False, False
-            t["pop"].configure(text="Pop out")
-
-    def toggle_pop(self, pid):
+    def to_desktop(self, pid):
         c, t = self.client(pid), self.tiles.get(pid)
         if not (c and t):
             return
-        if c.get("embedded"):
-            self.release_one(c, t)
-            t["popped"] = True
-            t["pop"].configure(text="Embed back")
-        else:
-            t["popped"], t["failed"] = False, False
-            t["pop"].configure(text="Pop out")
+        if self.stage_pid == pid:
+            self.unstage()
+        self.drop_thumb(pid)
+        self.unpark(c)
+        t["detached"] = True
+        if c["hwnd"]:
+            win_focus(c["hwnd"])
 
-    def toggle_big(self, pid):
-        t, c = self.tiles.get(pid), self.client(pid)
-        if not t:
-            return
-        t["big"] = not t["big"]
-        t["play"].configure(text="Shrink" if t["big"] else "Play ⤢")
-        self.resize_tile(pid)
-        if c and c.get("embedded") and c["hwnd"]:
-            user32.SetFocus(c["hwnd"])
+    def restore_all(self):
+        self.unstage(redraw=False)
+        for pid in list(self.thumbs):
+            self.drop_thumb(pid)
+        for c in self.core.snapshot():
+            if c.get("mv"):
+                self.unpark(c)
+        for t in self.tiles.values():
+            t["detached"] = False
+
+    def release_all(self):
+        self.restore_all()
+        self.active = False
+
+    def release_btn(self):
+        self.restore_all()
+        for t in self.tiles.values():
+            t["detached"] = True
+        self.app.toast("Windows are back on your desktop. Leave this tab and come back to preview them again.", "info")
 
     def on_enter(self):
         self.active = True
-        for c in self.core.snapshot():
-            if c.get("embedded") and c["hwnd"]:
-                user32.ShowWindow(c["hwnd"], 8)
+        self.after(60, self.schedule)
 
     def on_leave(self):
+        self.restore_all()
         self.active = False
-        for c in self.core.snapshot():
-            if c.get("embedded") and c["hwnd"]:
-                user32.ShowWindow(c["hwnd"], 0)
+
+    def pulse(self):
+        if self.active:
+            try:
+                self.sync()
+            except Exception:
+                pass
+        self.after(1000, self.pulse)
 
     def follow(self):
-        """Keyboard focus follows the mouse into the embedded client under the cursor."""
+        """Keyboard focus goes to the stage window while the mouse is over it."""
+        busy = self.active and self.stage_pid is not None
         try:
-            if self.active and (user32.GetForegroundWindow() or 0) == (user32.GetAncestor(self.winfo_id(), 2) or 0):
-                emb = [c for c in self.core.snapshot() if c.get("embedded") and c["hwnd"]]
-                if emb:
+            if busy and (user32.GetForegroundWindow() or 0) == (self.root() or 0):
+                c = self.client(self.stage_pid)
+                if c and c.get("embedded") and c["hwnd"]:
                     pt = POINT()
                     user32.GetCursorPos(ctypes.byref(pt))
                     under = user32.WindowFromPoint(pt)
-                    if under:
-                        for c in emb:
-                            h = c["hwnd"]
-                            if under == h or user32.IsChild(h, under):
-                                if (user32.GetFocus() or 0) != h:
-                                    user32.SetFocus(h)
-                                break
+                    if under and (under == c["hwnd"] or user32.IsChild(c["hwnd"], under)):
+                        if (user32.GetFocus() or 0) != c["hwnd"]:
+                            user32.SetFocus(c["hwnd"])
         except Exception:
             pass
-        self.after(120 if self.active else 1500, self.follow)
+        self.after(120 if busy else 1000, self.follow)
 
-    # -- tiles
+    # ---- tiles
     def make_tile(self, c):
-        f = card(self.host)
-        head = ctk.CTkFrame(f, fg_color="transparent")
-        head.pack(fill="x", padx=10, pady=(8, 4))
-        L(head, c["name"], 13, True).pack(side="left")
-        pl = pill(head, "Running", OK)
-        pl.pack(side="right")
-        view = tk.Frame(f, width=self.tw, height=self.th, bg="#05070a")
-        view.pack(padx=8, pady=(0, 6))
-        view.pack_propagate(False)
-        tk.Label(view, text="waiting for window…", fg="#8791a7", bg="#05070a").place(relx=0.5, rely=0.5, anchor="center")
-        row = ctk.CTkFrame(f, fg_color="transparent")
-        row.pack(fill="x", padx=8, pady=(0, 8))
+        f = card(self.area)
+        view = tk.Frame(f, bg="#05070a", cursor="hand2")
+        lab = tk.Label(view, text="starting…", fg="#8791a7", bg="#05070a", font=(FONT_FAMILY, 10))
+        lab.place(relx=0.5, rely=0.5, anchor="center")
+        cap = ctk.CTkFrame(f, fg_color="transparent")
         pid = c["pid"]
-        play = btn(row, "Play ⤢", lambda: self.toggle_big(pid), "accent", h=28, w=70)
-        play.pack(side="left")
-        pop = btn(row, "Pop out", lambda: self.toggle_pop(pid), "ghost", h=28, w=76)
-        pop.pack(side="left", padx=6)
-        btn(row, "Close", lambda: self.core.close_client(pid), "danger", h=28, w=60).pack(side="left")
-        info = L(row, "", 11, muted=True)
-        info.pack(side="right")
-        self.tiles[pid] = {"frame": f, "view": view, "pill": pl, "pop": pop, "play": play, "info": info,
-                           "saved": None, "popped": False, "failed": False, "big": False}
+        L(cap, c["name"], 12, True).pack(side="left")
+        pl = pill(cap, "…", T["muted"])
+        pl.pack(side="left", padx=6)
+        btn(cap, "✕", lambda: self.core.close_client(pid), "danger", w=30, h=26).pack(side="right")
+        btn(cap, "⧉", lambda: self.to_desktop(pid), "ghost", w=30, h=26).pack(side="right", padx=4)
+        btn(cap, "▶ Play", lambda: self.play(pid), "accent", w=70, h=26).pack(side="right")
+        for w in (view, lab):
+            w.bind("<Button-1>", lambda e, p=pid: self.play(p))
+        self.tiles[pid] = {"frame": f, "view": view, "lab": lab, "cap": cap, "pill": pl, "detached": False}
 
     def refresh(self):
         cl = sorted(self.core.snapshot(), key=lambda c: c["start"])
         alive = {c["pid"] for c in cl}
+        changed = False
         for pid in list(self.tiles):
             if pid not in alive:
+                self.drop_thumb(pid)
+                if self.stage_pid == pid:
+                    self.stage_pid = self.stage_saved = None
+                    self.back.pack_forget()
+                    self.stage.place_forget()
                 self.tiles.pop(pid)["frame"].destroy()
+                self.orig.pop(pid, None)
+                changed = True
         for c in cl:
             if c["pid"] not in self.tiles:
                 self.make_tile(c)
-        widest = max([self.tile_size(t)[0] for t in self.tiles.values()] or [self.tw])
-        cols = max(1, self.host.winfo_width() // (widest + 40))
+                changed = True
         order = [c["pid"] for c in cl]
-        if cols != self.cols or order != self.order:
-            self.cols, self.order = cols, order
-            for i in range(8):
-                self.host.grid_columnconfigure(i, weight=0)
-            for i, pid in enumerate(order):
-                self.tiles[pid]["frame"].grid(row=i // cols, column=i % cols, sticky="n", padx=6, pady=6)
+        if order != self._order:
+            self._order, changed = order, True
         if cl:
-            self.empty.grid_remove()
+            self.empty.place_forget()
         else:
-            self.empty.grid(row=0, column=0, pady=40)
+            self.empty.place(relx=0.5, rely=0.45, anchor="center")
         for c in cl:
             t = self.tiles[c["pid"]]
-            if self.active and c["hwnd"] and not c.get("embedded") and not t["popped"] and not t["failed"]:
-                self.embed_one(c, t)
+            if self.active and c["hwnd"] and not t["detached"] and not c.get("embedded") and not c.get("mv"):
+                self.park(c)
+                changed = True
+            state = win_state(c["hwnd"])
             if c.get("embedded"):
-                txt, col = ("Embedded", OK) if win_state(c["hwnd"]) != "Not responding" else ("Not responding", BAD)
-            elif t["failed"]:
-                txt, col = "Blocked", BAD
-            elif t["popped"]:
-                txt, col = "Popped out", WARN
+                txt, col = "Playing", OK
+            elif state == "Not responding":
+                txt, col = "Not responding", BAD
+            elif t["detached"]:
+                txt, col = "On desktop", WARN
+            elif state == "No window":
+                txt, col = "Starting", T["muted"]
             else:
-                txt, col = "Waiting", T["muted"]
+                txt, col = "Live", OK
             t["pill"].configure(text=f" {txt} ", text_color=col, fg_color=blend(col, T["panel"], .16))
-            w, h = self.tile_size(t)
-            t["info"].configure(text=f"{w}×{h}")
+        if changed and self.active:
+            self.schedule()
 
 
 # --------------------------------------------------------------- Monitor ---
@@ -3163,22 +3468,23 @@ class PerfPage(Page):
     def __init__(self, parent, app):
         super().__init__(parent, app, "Performance", "Make every Roblox client use less CPU and GPU")
         db = self.core.db
-        self.sel = db.get("preset") if db.get("preset") in ("balanced", "low", "ultra", "minimal", "lowest") else "custom"
+        self.sel = db.get("preset") if db.get("preset") in ("smooth", "balanced", "low", "ultra", "minimal", "lowest") else "custom"
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x")
-        row.grid_columnconfigure(tuple(range(6)), weight=1, uniform="pp")
+        row.grid_columnconfigure(tuple(range(4)), weight=1, uniform="pp")
         self.pcards = {}
         info = {"balanced": ("Balanced", "Windows defaults. Nothing is throttled."),
                 "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients in efficiency mode."),
                 "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, efficiency mode, {max(1, NCPU // 2)} core(s) each, power-saving GPU."),
                 "minimal": ("Minimal", "10% CPU cap, 320×180, 15 FPS, graphics 1/10, 1 core each, efficiency mode, memory trim. As light as it gets."),
-                "lowest": ("Lowest · 5% / 5%", "5% CPU, 5% GPU and 100 MB RAM max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
+                "lowest": ("Lowest · 5% / 5%", "5% CPU, 5% GPU, 200 MB RAM max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
+                "smooth": ("Smooth · auto-lowest", "Adapts live: each client gets just enough CPU not to stutter, windows shrink only when the GPU is busy, 45 FPS cap, graphics 1/10. No RAM cap, so no swapping."),
                 "custom": ("Custom", "Every option below, your values.")}
-        for i, k in enumerate(("balanced", "low", "ultra", "minimal", "lowest", "custom")):
+        for i, k in enumerate(("smooth", "balanced", "low", "ultra", "minimal", "lowest", "custom")):
             f = card(row)
-            f.grid(row=0, column=i, sticky="nsew", padx=4)
+            f.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
             L(f, info[k][0], 15, True).pack(anchor="w", padx=14, pady=(12, 2))
-            L(f, info[k][1], 11, muted=True, wraplength=140, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
+            L(f, info[k][1], 11, muted=True, wraplength=230, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
             for w in [f] + list(f.winfo_children()):
                 w.bind("<Button-1>", lambda e, k=k: self.choose(k))
             self.pcards[k] = f
@@ -3215,8 +3521,8 @@ class PerfPage(Page):
         self.cap = slider_row(a, "Hard CPU cap per client (0 = off)", 0, 100, 100, db.num("p_cap", 0, 100),
                               lambda v: "off" if int(v) == 0 else f"{int(v)}% of total CPU")
         self.cw.append(self.cap)
-        self.ramcap = slider_row(a, "RAM limit per client, MB (0 = off)", 0, 2000, 100, db.num("p_ramcap", 0, 8000),
-                                 lambda v: "off" if int(v) == 0 else f"{int(v)} MB max")
+        self.ramcap = slider_row(a, "RAM max per client, MB (0 = off)", 0, 1000, 100, db.num("p_ramcap", 0, 8000),
+                                 lambda v: "off" if int(v) == 0 else f"up to {int(v)} MB")
         self.cw.append(self.ramcap)
         self.iv = slider_row(a, "Monitoring interval", 1, 15, 14, db.num("interval", 1, 30), lambda v: f"{int(v)} s")
         L(b, "GPU and display", 14, True, color=T["accent"]).pack(anchor="w", pady=(4, 6))
@@ -3256,6 +3562,13 @@ class PerfPage(Page):
         bar.pack(fill="x")
         btn(bar, "Apply and save", self.save, "accent", w=150, h=38).pack(side="left")
         btn(bar, "Undo Roblox graphics changes", self.undo, "ghost", w=210, h=38).pack(side="left", padx=8)
+        self.sw_ = {}
+        for key, text in (("ram_guard", "Keep disk under 2%"), ("relax_on", "Ease limits after a crash")):
+            sw = SW(bar, text, command=lambda k=key: db.set(k, "1" if self.sw_[k].get() else "0"))
+            if db.flag(key):
+                sw.select()
+            sw.pack(side="left", padx=10)
+            self.sw_[key] = sw
         self.live = L(bar, "", 12, muted=True)
         self.live.pack(side="right")
         self.choose(self.sel, init=True)
@@ -3299,7 +3612,7 @@ class PerfPage(Page):
 
     def refresh(self):
         cl = self.core.snapshot()
-        self.live.configure(text=f"{len(cl)} client(s)  ·  {sum(c['cpu'] for c in cl):.1f}% CPU  ·  {fmt_mb(sum(c['rss'] for c in cl))} RAM")
+        self.live.configure(text=f"{len(cl)} client(s)  ·  {sum(c['cpu'] for c in cl):.1f}% CPU  ·  {fmt_mb(sum(c['rss'] for c in cl))} RAM  ·  disk {self.core.disk_pct:.1f}%")
 
 
 # -------------------------------------------------------------- Settings ---
@@ -3385,15 +3698,14 @@ class SettingsPage(Page):
             self.sw[key] = s
         btn(p, "Apply appearance", self.apply_appearance, "accent", w=180, h=38).pack(anchor="w", pady=(10, 0))
 
-        p = section("RoManager's own CPU / GPU use", "RoManager is light already. These make it lighter still.")
+        p = section("RoManager's own CPU / GPU use", "RoManager may use up to this much CPU to stay smooth. The Roblox clients keep their own, much lower limits.")
         slider_row(p, "UI refresh interval", 1, 10, 9, db.num("ui_iv", 1, 10), lambda v: f"{int(v)} s",
                    save=lambda v: db.set("ui_iv", int(v)))
         switch(p, "Slow down while in the background, pause while minimized", "ui_pause")
         switch(p, "Run RoManager in Windows efficiency mode while idle", "self_eco")
         switch(p, "Efficiency mode all the time, not only while idle", "self_eco_always")
-        switch(p, "Live window previews (Windows tab)", "prev_on")
-        slider_row(p, "Preview refresh interval", 2, 60, 58, db.num("prev_iv", 2, 60), lambda v: f"{int(v)} s",
-                   save=lambda v: db.set("prev_iv", int(v)))
+        slider_row(p, "RoManager CPU ceiling (hard limit)", 5, 100, 19, db.num("app_cap", 5, 100), lambda v: f"{int(v)}%",
+                   save=lambda v: (db.set("app_cap", int(v)), set_self_cap(int(v))))
         p = section("General")
         switch(p, "Start with Windows", "autostart", self.autostart)
         switch(p, "Start minimized", "start_min")
@@ -3503,6 +3815,40 @@ class SettingsPage(Page):
 
 
 # ------------------------------------------------------------------- App ---
+class Splash(ctk.CTkToplevel):
+    """Loading screen shown while the interface is built."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.overrideredirect(True)
+        w, h = 460, 290
+        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 2}")
+        self.configure(fg_color=T["bg"])
+        self.attributes("-topmost", True)
+        box = ctk.CTkFrame(self, fg_color=T["panel"], border_color=T["border"], border_width=1, corner_radius=R + 6)
+        box.pack(fill="both", expand=True, padx=1, pady=1)
+        ctk.CTkLabel(box, text="◈", font=F(54, True), text_color=T["accent"]).pack(pady=(30, 0))
+        ctk.CTkLabel(box, text="RoManager", font=F(28, True), text_color=T["text"]).pack()
+        self.msg = ctk.CTkLabel(box, text="Starting…", font=F(12), text_color=T["muted"])
+        self.msg.pack(pady=(6, 16))
+        self.bar = ctk.CTkProgressBar(box, height=6, width=320, progress_color=T["accent"], fg_color=T["panel2"])
+        self.bar.set(0)
+        self.bar.pack()
+        self.update()
+
+    def step(self, text, value):
+        self.msg.configure(text=text)
+        self.bar.set(value)
+        self.update()
+
+    def close(self):
+        for i in range(8):
+            self.attributes("-alpha", 1 - i / 8)
+            self.update()
+            time.sleep(0.01)
+        self.destroy()
+
+
 class LazyPages(dict):
     """Builds a tab the first time it is opened, so start-up and idle memory stay small."""
 
@@ -3522,6 +3868,7 @@ class App(ctk.CTk):
 
     def __init__(self, core):
         super().__init__()
+        self.withdraw()
         self.core = core
         self.selected, self.avatars, self.uiq, self.toasts = set(), {}, queue.Queue(), []
         self.current = "Home"
@@ -3529,19 +3876,35 @@ class App(ctk.CTk):
         self.geometry("1320x820")
         self.minsize(1080, 680)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        apply_theme(core.db)
+        splash = Splash(self)
+        splash.step("Preparing the interface…", 0.25)
         self.build()
+        splash.step("Loading your accounts…", 0.6)
         self.show("Home")
-        self.after(300, self.pump)
-        self.after(1200, self.tick)
-        if core.db.flag("multi") and not core.mutex:
-            self.after(900, lambda: self.toast(core.multi_status, "warn"))
-        if core.db.flag("anim"):
-            self.attributes("-alpha", 0.0)
-            self.fade(0)
+        style_window(self)
+        splash.step("Almost ready…", 0.9)
+        self.after(100, self.pump)
+        self.after(1000, self.tick)
+        if not core.mutex:
+            self.after(1200, lambda: self.toast(core.multi_status, "warn"))
+        if not roblox_installed():
+            self.after(900, lambda: self.toast("Roblox Player not found for this Windows user. Install it from roblox.com.", "warn"))
+        splash.step("Ready", 1.0)
+        splash.close()
         if core.db.flag("start_min"):
             self.iconify()
-        if not roblox_installed():
-            self.after(600, lambda: self.toast("Roblox Player not found for this Windows user. Install it from roblox.com.", "warn"))
+        else:
+            if core.db.flag("anim"):
+                self.attributes("-alpha", 0.0)
+            self.deiconify()
+            if core.db.flag("anim"):
+                self.fade(0)
+
+    def report_callback_exception(self, exc, val, tb):
+        import traceback
+        _log_crash("".join(traceback.format_exception(exc, val, tb)))
+        self.core.log(f"UI error: {val}")
 
     def fade(self, n):
         target = self.core.db.num("opacity", 50, 100) / 100
@@ -3565,8 +3928,9 @@ class App(ctk.CTk):
         small = db.flag("sidebar_small")
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        side = ctk.CTkFrame(self, width=76 if small else 224, fg_color=T["side"], corner_radius=0, border_width=0)
-        side.grid(row=0, column=0, sticky="nsw")
+        side = ctk.CTkFrame(self, width=76 if small else 224, fg_color=T["panel"], corner_radius=R, border_width=1,
+                            border_color=T["border"])
+        side.grid(row=0, column=0, sticky="nsw", padx=(14, 0), pady=14)
         side.grid_propagate(False)
         logo = ctk.CTkFrame(side, fg_color="transparent")
         logo.pack(fill="x", padx=16, pady=(24, 20))
@@ -3608,6 +3972,7 @@ class App(ctk.CTk):
                 pass
         self.avatars = {k: v for k, v in self.avatars.items() if v is not None}
         self.build()
+        style_window(self)
         self.show(page)
 
     def show(self, name):
@@ -3620,7 +3985,7 @@ class App(ctk.CTk):
             self.pages[name].on_enter()
         for n, (b, ind) in self.navb.items():
             on = n == name
-            b.configure(fg_color=blend(T["accent"], T["side"], .16) if on else "transparent",
+            b.configure(fg_color=blend(T["accent"], T["panel"], .16) if on else "transparent",
                         text_color=T["text"] if on else T["muted"])
             ind.configure(fg_color=T["accent"] if on else "transparent")
         try:
@@ -3663,7 +4028,7 @@ class App(ctk.CTk):
                     self.core.log(f"UI error: {e}")
         except queue.Empty:
             pass
-        self.after(1000 if self.state() == "iconic" else 300, self.pump)
+        self.after(1000 if self.state() == "iconic" else 100, self.pump)
 
     def ui(self, fn):
         self.uiq.put(fn)
@@ -3750,6 +4115,23 @@ class App(ctk.CTk):
         self.destroy()
 
 
+def _log_crash(text):
+    try:
+        f = APPDIR / "crash.log"
+        if f.exists() and f.stat().st_size > 200_000:
+            f.unlink()
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}]\n{text}\n")
+    except Exception:
+        pass
+
+
+def install_crash_logging():
+    import traceback
+    sys.excepthook = lambda et, ev, tb: _log_crash("".join(traceback.format_exception(et, ev, tb)))
+    threading.excepthook = lambda a: _log_crash("".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+
+
 def unlock(core):
     ok, tries = [False], [0]
     w = ctk.CTk()
@@ -3785,6 +4167,7 @@ def main():
     if "--login" in sys.argv:
         login_window()
         return
+    install_crash_logging()
     try:
         core = Core()
     except Exception as e:
@@ -3793,12 +4176,9 @@ def main():
     apply_theme(core.db)
     if core.db.get("lock_hash") and not unlock(core):
         return
-    try:
-        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # the manager never needs to outrun the games
-    except psutil.Error:
-        pass
-    sys.setswitchinterval(0.05)
+    sys.setswitchinterval(0.005)
     core.start()
+    set_self_cap(core.db.num("app_cap", 5, 100))
     App(core).mainloop()
 
 
