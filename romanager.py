@@ -2,24 +2,25 @@
 RoManager - Roblox multi-account manager and multi-instance launcher (single file).
 Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, pywebview.
 
-Status: written without a Windows machine to test on. Expect to paste back errors
-from the first runs.
-
 Not implemented (no fake buttons): tray icon, language packs, auto-updater,
 whole-file database encryption (secrets are DPAPI-encrypted per field), adopting
 Roblox clients that were started before RoManager.
 
-Build as an exe with: pyinstaller --onefile --windowed --name RoManager romanager.py
+Build as an exe with:
+  pyinstaller --onedir --windowed --name RoManager --collect-all customtkinter --collect-all webview romanager.py
+(--onefile also works, but every login window then re-extracts the exe and starts slower.)
 
-Changes in this version:
-  * Splash screen is built from plain tkinter widgets, so rebuilding the UI / changing the widget
-    scaling can no longer destroy its labels (fixes: TclError invalid command name ".!splash...label").
-  * No background process: closing the window ends RoManager completely (threads stopped, the login
-    window process killed, multi-instance objects released, then the process exits).
-  * Frozen (.exe) builds no longer appear as a window-less background process: stdout/stderr are
-    redirected when a --windowed PyInstaller build leaves them as None (previously any stray print()
-    could crash the process silently before a window ever opened), and a single-instance guard now
-    brings the existing window to the front instead of starting an invisible duplicate process.
+Lifecycle guarantees in this version:
+  * Closing the window ends RoManager completely: worker threads stop, the login window process tree is killed,
+    the CPU / RAM / efficiency / affinity limits RoManager put on your Roblox clients are taken back, job-object
+    handles and the multi-instance objects are released, the database is closed, and the process exits
+    (with a hard-exit watchdog in case anything hangs).
+  * The login window process always ends with os._exit: when login finishes, when its window is closed,
+    when RoManager is gone, or after 30 minutes. It is also placed in a kill-on-close job object.
+  * Startup errors and crashes in a windowed exe are shown in a message box and written to crash.log,
+    and the process still exits cleanly afterwards.
+  * A second launch brings the running window to the front instead of starting an invisible duplicate.
+  * Logs, history tables and temp files are bounded, and per-client job handles are closed when a client exits.
 """
 import collections, ctypes, hashlib, hmac, io, json, math, os, queue, random
 import re, secrets, shutil, sqlite3, subprocess, sys, threading, time, urllib.error
@@ -29,14 +30,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, messagebox, simpledialog
 
-# --- exe / background-process fix -----------------------------------------
-# A windowed PyInstaller build (no console) gives this process sys.stdout
-# and sys.stderr set to None. Any print()/write() call anywhere (this file
-# or a library) then raises before a window ever appears, and because there
-# is no console to show the error, the process just sits in Task Manager
-# with no window and quietly dies or lingers - "running in the background"
-# with nothing to show for it. Redirecting to os.devnull up front removes
-# that failure mode.
+# A windowed PyInstaller build (no console) gives this process sys.stdout / sys.stderr = None.
+# Any print() would then raise before a window appears. Redirect them up front.
 if getattr(sys, "frozen", False):
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
@@ -47,8 +42,22 @@ if sys.platform != "win32":
     print("RoManager only runs on Windows 10/11.")
     sys.exit(1)
 
-import psutil
-import customtkinter as ctk
+
+def _fatal(msg):
+    try:
+        ctypes.windll.user32.MessageBoxW(0, msg, "RoManager", 0x10)
+    except Exception:
+        pass
+    os._exit(1)
+
+
+try:
+    import psutil
+    import customtkinter as ctk
+except Exception:
+    import traceback
+    _fatal("RoManager could not start because a required component is missing:\n\n"
+           + traceback.format_exc()[-900:])
 
 try:
     from PIL import Image
@@ -199,6 +208,7 @@ class DB:
         APPDIR.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self._cache = {}
+        self.closed = False
         self.c = self._open(APPDIR / "romanager.db")
         ver = self.c.execute("PRAGMA user_version").fetchone()[0]
         for i, sql in enumerate(MIGRATIONS[ver:], start=ver + 1):
@@ -256,6 +266,9 @@ class DB:
     def close(self):
         """Flush and close the database so no -wal/-shm handle is left behind."""
         with self.lock:
+            if self.closed:
+                return
+            self.closed = True
             try:
                 self.c.commit()
                 self.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -281,17 +294,21 @@ class DB:
             return self.c.execute(sql, args).fetchone()
 
     def get(self, k):
-        if k in self._cache:
-            return self._cache[k]
-        r = self.one("SELECT value FROM settings WHERE key=?", (k,))
-        v = r[0] if r else DEFAULTS.get(k, "")
-        self._cache[k] = v
-        return v
+        with self.lock:
+            if k in self._cache:
+                return self._cache[k]
+            if self.closed:
+                return DEFAULTS.get(k, "")
+            r = self.c.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+            v = r[0] if r else DEFAULTS.get(k, "")
+            self._cache[k] = v
+            return v
 
     def set(self, k, v):
-        self.q("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-               (k, str(v)))
-        self._cache[k] = str(v)
+        with self.lock:
+            self.q("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (k, str(v)))
+            self._cache[k] = str(v)
 
     def flag(self, k):
         return self.get(k) == "1"
@@ -524,16 +541,47 @@ def _wipe(path):
         pass
 
 
+def clean_tmp():
+    """Leftovers of a crashed login (encrypted credentials / cookie) are wiped at every start."""
+    try:
+        for f in _tmpdir().glob("*"):
+            _wipe(f)
+    except Exception:
+        pass
+
+
 def login_window():
-    """Runs in a separate process (--login <token>). Opens the real Roblox login page in a private
-    WebView2 window. Credentials (optional) arrive and the session leaves through short-lived
-    DPAPI-encrypted files that are wiped immediately, because a windowed exe has no stdin/stdout."""
-    tok = sys.argv[sys.argv.index("--login") + 1] if len(sys.argv) > sys.argv.index("--login") + 1 else "x"
+    """Runs in a separate process (--login <token> --parent <pid>). Opens the real Roblox login page in a
+    private WebView2 window. Credentials (optional) arrive and the session leaves through short-lived
+    DPAPI-encrypted files that are wiped immediately (a windowed exe has no stdin/stdout).
+    It always ends with os._exit, so it can never linger: it exits when the login finishes, when the window
+    is closed, when the main app is gone, or after 30 minutes."""
+    argv = sys.argv
+    at = argv.index("--login")
+    tok = argv[at + 1] if len(argv) > at + 1 else "x"
+    pproc = None
+    if "--parent" in argv:
+        try:
+            pproc = psutil.Process(int(argv[argv.index("--parent") + 1]))
+        except (ValueError, IndexError, psutil.Error):
+            os._exit(0)  # parent already gone
     base = _tmpdir() / tok
+    closed = threading.Event()
+    deadline = time.time() + 30 * 60
 
     def fail(msg):
-        base.with_suffix(".err").write_text(msg, encoding="utf-8")
+        try:
+            base.with_suffix(".err").write_text(msg, encoding="utf-8")
+        except OSError:
+            pass
 
+    def watchdog():
+        while True:
+            time.sleep(2)
+            if (pproc is not None and not pproc.is_running()) or time.time() > deadline:
+                os._exit(0)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     try:
         import webview
         creds = None
@@ -546,6 +594,10 @@ def login_window():
         win = webview.create_window("Log in to Roblox - RoManager", "https://www.roblox.com/login",
                                     width=520, height=780)
         box = {"creds": creds}
+        try:
+            win.events.closed += lambda *a: closed.set()
+        except Exception:
+            pass
 
         def fill(*_):
             c = box["creds"]
@@ -563,9 +615,12 @@ def login_window():
             win.events.loaded += fill
 
         def watch():
-            logged_since, last_err = None, ""
-            while True:
+            logged_since, last_err, bad = None, "", 0
+            while not closed.is_set():
                 time.sleep(1.5)
+                if closed.is_set():
+                    return
+                ok = False
                 try:
                     for jar in win.get_cookies():
                         if ".ROBLOSECURITY" in jar:
@@ -574,13 +629,22 @@ def login_window():
                                 base.with_suffix(".out").write_bytes(dpapi_protect(val.encode()))
                                 win.destroy()
                                 return
+                    ok = True
                 except Exception as e:
                     last_err = f"cookies: {e}"
                 url = ""
                 try:
                     url = win.get_current_url() or win.evaluate_js("location.href") or ""
+                    ok = True
                 except Exception as e:
                     last_err = f"url: {e}"
+                bad = 0 if ok else bad + 1
+                if bad >= 6:  # the window is gone or broken: stop instead of looping forever
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    return
                 if any(x in url for x in ("/home", "/games", "/discover", "/charts")):
                     logged_since = logged_since or time.time()
                     if time.time() - logged_since > 15:
@@ -592,13 +656,32 @@ def login_window():
         webview.start(watch, private_mode=True)
     except ModuleNotFoundError as e:
         fail(f"This build of RoManager is missing the login component ('{e.name}'). "
-             "Rebuild it with the updated build.yml (it installs pywebview), or use Import cookie meanwhile.")
+             "Rebuild with --collect-all webview (and install pywebview), or use Import cookie meanwhile.")
     except Exception:
         import traceback
         fail(traceback.format_exc())
+    finally:
+        os._exit(0)  # never leave this process (or its WebView2 helpers) behind
 
 
 _LOGIN_PROCS = []  # login-window subprocesses, so closing RoManager can end them too
+APP_STOPPING = threading.Event()
+_LOGIN_JOB = None
+
+
+def _login_job():
+    """A job object that kills its processes when RoManager's handle closes, even if RoManager crashes."""
+    global _LOGIN_JOB
+    if _LOGIN_JOB is None:
+        job = kernel32.CreateJobObjectW(None, None)
+        if job:
+            ext = JOB_EXT_LIMIT()
+            ext.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if kernel32.SetInformationJobObject(job, 9, ctypes.byref(ext), ctypes.sizeof(ext)):
+                _LOGIN_JOB = job
+            else:
+                kernel32.CloseHandle(job)
+    return _LOGIN_JOB
 
 
 def kill_login_procs():
@@ -619,8 +702,8 @@ def kill_login_procs():
 def browser_login(user=None, pw=None):
     tok = secrets.token_hex(8)
     base = _tmpdir() / tok
-    cmd = [sys.executable, "--login", tok] if getattr(sys, "frozen", False) else \
-        [sys.executable, os.path.abspath(sys.argv[0]), "--login", tok]
+    cmd = [sys.executable, "--login", tok, "--parent", str(os.getpid())] if getattr(sys, "frozen", False) else \
+        [sys.executable, os.path.abspath(sys.argv[0]), "--login", tok, "--parent", str(os.getpid())]
     proc = None
     try:
         if user and pw:
@@ -628,7 +711,19 @@ def browser_login(user=None, pw=None):
         proc = subprocess.Popen(cmd, creationflags=0x08000000, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _LOGIN_PROCS.append(proc)
-        proc.wait()  # no time limit: it ends when you finish logging in or close the window
+        job = _login_job()
+        if job:
+            try:
+                kernel32.AssignProcessToJobObject(job, int(proc._handle))
+            except Exception:
+                pass
+        while True:  # ends when you finish logging in, close the window, or RoManager closes
+            try:
+                proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if APP_STOPPING.is_set():
+                    raise RuntimeError("RoManager is closing.")
         out, err = base.with_suffix(".out"), base.with_suffix(".err")
         if out.exists():
             return dpapi_unprotect(out.read_bytes()).decode()
@@ -885,6 +980,48 @@ def set_self_cap(pct):
         return False
 
 
+def release_self():
+    """Takes RoManager's own CPU ceiling off (only if one was ever set)."""
+    if _SELF_JOB is not None:
+        set_self_cap(0)
+
+
+def release_client(c):
+    """Takes back every limit RoManager put on one Roblox client and closes its job handle. Windows keeps a
+    job's CPU cap, a working-set cap, efficiency mode and an affinity mask alive as long as the client runs, even
+    after RoManager exits, so they have to be lifted explicitly - closing a handle alone does not do it."""
+    pid = c["pid"]
+    try:
+        if c.get("job"):
+            os_set_cap(c, 0)
+        if c.get("ram_set"):
+            os_set_ramcap(pid, 0)
+        if c.get("eco_set"):
+            os_set_eco(pid, False)
+        if c.get("mem_set"):
+            os_set_memprio(pid, 5)
+        if c.get("aff_set"):
+            try:
+                c["proc"].cpu_affinity(list(range(NCPU)))
+            except Exception:
+                pass
+        if c.get("tuned") is not None:
+            try:
+                c["proc"].nice(psutil.NORMAL_PRIORITY_CLASS)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    j = c.get("job")
+    if j:
+        try:
+            kernel32.CloseHandle(j)
+        except Exception:
+            pass
+        c["job"] = None
+    c["cap_set"] = c["ram_set"] = c["eco_set"] = c["mem_set"] = c["aff_set"] = False
+
+
 class PDH_VALUE(ctypes.Structure):
     _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
 
@@ -963,6 +1100,15 @@ class SysMeter:
             out.append(v.doubleValue)
         return out[0], out[1]
 
+    def close(self):
+        if self.q and self.q.value:
+            try:
+                pdh.PdhCloseQuery(self.q)
+            except Exception:
+                pass
+            self.q = ctypes.c_void_p()
+            self.ok = False
+
 
 def roblox_exes():
     roots = [Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "Versions",
@@ -986,6 +1132,7 @@ class Core:
         self.clients = {}
         self.lock = threading.RLock()
         self.logs = []
+        self.log_total = 0  # lines ever logged (the list itself is trimmed, so UIs follow this counter)
         self.toastq = []
         self.hist = collections.deque(maxlen=3700)
         self.started = time.time()
@@ -1002,29 +1149,59 @@ class Core:
         self.pause_ev.set()
         self.cancel_ev = threading.Event()
         self.stop = False
+        self._down = False
 
     # -- infra
     def log(self, msg, kind=None):
         self.logs.append(f"[{datetime.now():%H:%M:%S}] {msg}")
-        if kind:
+        self.log_total += 1
+        if len(self.logs) > 1500:
+            del self.logs[:500]
+        if kind and len(self.toastq) < 50:
             self.toastq.append((msg, kind))
 
     def start(self):
+        clean_tmp()
+        try:  # history tables stay bounded
+            self.db.q("DELETE FROM launch_history WHERE id NOT IN (SELECT id FROM launch_history ORDER BY id DESC LIMIT 500)")
+            self.db.q("DELETE FROM recovery_history WHERE id NOT IN (SELECT id FROM recovery_history ORDER BY id DESC LIMIT 500)")
+            self.db.q("DELETE FROM clients")  # clients are never adopted across runs, so stale rows are useless
+        except Exception:
+            pass
         psutil.cpu_percent(None)
         threading.Thread(target=self.sample_loop, daemon=True).start()
         threading.Thread(target=self.gpu_loop, daemon=True).start()
         self.log(self.set_multi(True))
 
     def shutdown(self):
-        """Stop every background activity of RoManager. Roblox clients you launched are left running."""
+        """Stop every background activity of RoManager and take back every limit it put on your Roblox clients.
+        The clients themselves are left running."""
+        if self._down:
+            return
+        self._down = True
         self.stop = True
+        APP_STOPPING.set()
         self.cancel_ev.set()
         self.pause_ev.set()
+        for c in self.snapshot():
+            try:
+                release_client(c)
+            except Exception:
+                pass
         try:
             self.set_multi(False)  # release the single-instance mutex/event
         except Exception:
             pass
+        try:
+            if self.meter:
+                self.meter.close()
+        except Exception:
+            pass
         kill_login_procs()
+        try:
+            release_self()
+        except Exception:
+            pass
         self.db.close()
 
     def notify(self, kind, text):
@@ -1108,7 +1285,7 @@ class Core:
             cookie = dpapi_unprotect(acc["cookie_enc"]).decode()
             self.resolve_dest(cookie, dest)
             pid = self._start_client(acc, cookie, dest, iso)
-            if pid is None and iso:
+            if pid is None and iso and not self.stop:
                 self.log(f"{name}: the isolated start produced no client, retrying with the standard launcher.", "warn")
                 pid = self._start_client(acc, cookie, dest, False)
         except AuthExpired:
@@ -1149,6 +1326,8 @@ class Core:
         return None
 
     def _check_kill(self, others, name):
+        if self.stop:
+            return
         dead = [p for p in others if not psutil.pid_exists(p)]
         if dead:
             self.log(f"{len(dead)} other client(s) closed when {name} started, so Roblox's single-instance lock is "
@@ -1208,7 +1387,7 @@ class Core:
         self.apply_global_perf()
         for i, aid in enumerate(ids):
             self.pause_ev.wait()
-            if self.cancel_ev.is_set():
+            if self.cancel_ev.is_set() or self.stop:
                 self.log("Launch queue cancelled.")
                 break
             row = self.db.one("SELECT username, alias FROM accounts WHERE id=?", (aid,))
@@ -1227,13 +1406,16 @@ class Core:
             except Exception as e:
                 self.qs["failed"] += 1
                 self.failed += 1
-                self.db.q("INSERT INTO launch_history(account_id,dest,ts,ok,error) VALUES(?,?,?,0,?)",
-                          (aid, dest_label(dest), time.time(), str(e)))
+                try:
+                    self.db.q("INSERT INTO launch_history(account_id,dest,ts,ok,error) VALUES(?,?,?,0,?)",
+                              (aid, dest_label(dest), time.time(), str(e)))
+                except Exception:
+                    pass
                 self.log(f"{name}: FAILED - {e}", "bad")
             self.qs["done"] = i + 1
             if i < len(ids) - 1:
                 t_end = time.time() + delay
-                while time.time() < t_end and not self.cancel_ev.is_set():
+                while time.time() < t_end and not self.cancel_ev.is_set() and not self.stop:
                     self.pause_ev.wait()
                     time.sleep(0.25)
         self.qs["running"] = False
@@ -1266,6 +1448,8 @@ class Core:
 
         def go():
             time.sleep(2)
+            if self.stop:
+                return
             try:
                 self.launch_one(aid, dest)
                 self.log(f"{c['name']}: restarted")
@@ -1467,6 +1651,8 @@ class Core:
             c["last_trim"] = now
 
     def tune_all(self, cl=None):
+        if self.stop:
+            return
         cl = self.snapshot() if cl is None else cl
         if not cl:
             return
@@ -1593,7 +1779,10 @@ class Core:
     def gpu_loop(self):
         wait = 4
         while not self.stop:
-            time.sleep(wait)
+            slept = 0.0
+            while slept < wait and not self.stop:  # short sleeps so shutdown is not delayed
+                time.sleep(0.5)
+                slept += 0.5
             if self.stop:
                 break
             wait = 10  # relaxed, unless a client needed adjusting
@@ -1639,7 +1828,11 @@ class Core:
     def sample_loop(self):
         while not self.stop:
             iv = self.profile()["interval"]
-            time.sleep(iv if self.clients else max(iv, 10))
+            wait = iv if self.clients else max(iv, 10)
+            slept = 0.0
+            while slept < wait and not self.stop:  # short sleeps so shutdown is not delayed
+                time.sleep(0.5)
+                slept += 0.5
             if self.stop:
                 break
             try:
@@ -1648,6 +1841,8 @@ class Core:
                 self.log(f"Monitor error: {e}")
 
     def sample(self):
+        if self.stop:
+            return
         vm = psutil.virtual_memory()
         net = psutil.net_io_counters()
         now = time.time()
@@ -1736,7 +1931,13 @@ class Core:
     def on_exit(self, pid):
         with self.lock:
             c = self.clients.pop(pid, None)
-        self.db.q("DELETE FROM clients WHERE pid=?", (pid,))
+        if c:
+            release_client(c)  # closes the per-client job handle (no handle leak per client)
+        if not self.stop:
+            try:
+                self.db.q("DELETE FROM clients WHERE pid=?", (pid,))
+            except Exception:
+                pass
         if not c:
             return
         if c["expected"]:
@@ -1744,7 +1945,7 @@ class Core:
             return
         self.failed += 1
         self.log(f"{c['name']}: client exited unexpectedly (PID {pid})", "bad")
-        if time.time() - c["start"] < 900 and self.limited(c):
+        if time.time() - c["start"] < 900 and self.limited_was(c):
             self._relax(f"{c['name']} crashed under the limits.")
         self.notify("crash", f"{c['name']}: Roblox client (PID {pid}) exited unexpectedly.")
         if not self.db.flag("auto"):
@@ -1755,12 +1956,19 @@ class Core:
         n = self.attempts.get(aid, 0)
         threading.Thread(target=self._recover, args=(aid, c["name"], c["dest"], n), daemon=True).start()
 
+    def limited_was(self, c):
+        """Whether the client was running under limits when it ended (release_client already cleared the flags)."""
+        st = c.get("tuned")
+        return bool(st and (st[1] or st[3] or st[6] or st[7]))
+
     def _recover(self, aid, name, dest, n):
         mx = self.db.num("max_attempts", 1, 20)
         while n < mx and not self.stop:
             n += 1
             self.attempts[aid] = n
-            time.sleep(self.db.num("restart_delay", 1, 3600))
+            t_end = time.time() + self.db.num("restart_delay", 1, 3600)
+            while time.time() < t_end and not self.stop:
+                time.sleep(0.5)
             if self.stop:
                 return
             try:
@@ -1771,9 +1979,13 @@ class Core:
                 self.notify("restart", f"{name}: client restarted (attempt {n}/{mx}).")
                 return
             except Exception as e:
+                if self.stop:
+                    return
                 self.db.q("INSERT INTO recovery_history(account_id,ts,attempt,result) VALUES(?,?,?,?)",
                           (aid, time.time(), n, f"failed: {e}"))
                 self.log(f"{name}: restart attempt {n}/{mx} failed - {e}")
+        if self.stop:
+            return
         self.log(f"{name}: giving up after {mx} attempts", "bad")
         self.notify("restart", f"{name}: automatic restart gave up after {mx} attempts.")
 
@@ -2711,6 +2923,8 @@ class AccountsPage(Page):
                 added = updated = 0
                 failed = []
                 for i, ck_ in enumerate(cookies, 1):
+                    if APP_STOPPING.is_set():
+                        break
                     self.app.ui(lambda i=i: status.configure(text=f"Checking {i}/{len(cookies)}…", text_color=T["muted"]))
                     try:
                         me = whoami(ck_)
@@ -2782,7 +2996,7 @@ class AccountsPage(Page):
         if not ids or not messagebox.askyesno(APP_NAME, f"Securely remove {len(ids)} account(s)? The stored session is overwritten and deleted."):
             return
         for i in ids:
-            self.core.db.q("UPDATE accounts SET cookie_enc=? WHERE id=?", (os.urandom(256), i))
+            self.core.db.q("UPDATE accounts SET cookie_enc=?, pw_enc=NULL WHERE id=?", (os.urandom(256), i))
             self.core.db.q("DELETE FROM accounts WHERE id=?", (i,))
             self.app.selected.discard(i)
         self.rebuild()
@@ -2792,6 +3006,8 @@ class AccountsPage(Page):
 
         def work():
             for i in ids:
+                if APP_STOPPING.is_set():
+                    break
                 a = self.core.db.one("SELECT cookie_enc FROM accounts WHERE id=?", (i,))
                 try:
                     cookie = dpapi_unprotect(a["cookie_enc"]).decode()
@@ -2967,13 +3183,21 @@ class PlayPage(Page):
                 if r["dest"] not in seen and len(seen) < 12 and r["dest"].split()[0].isdigit():
                     seen.add(r["dest"])
                     btn(self.hist, r["dest"], lambda p=r["dest"].split()[0]: self.fill(p), "ghost").pack(fill="x", pady=2)
-        if self.seen < len(self.core.logs):
+        total = self.core.log_total
+        if self.seen < total:
+            logs = list(self.core.logs)
+            new = min(total - self.seen, len(logs))
             self.log.configure(state="normal")
-            for line in self.core.logs[self.seen:]:
+            for line in (logs[-new:] if new else []):
                 self.log.insert("end", line + "\n")
+            try:  # the visible log stays bounded too
+                if int(self.log.index("end-1c").split(".")[0]) > 1500:
+                    self.log.delete("1.0", "500.0")
+            except Exception:
+                pass
             self.log.see("end")
             self.log.configure(state="disabled")
-            self.seen = len(self.core.logs)
+            self.seen = total
 
 
 # --------------------------------------------------------------- Windows ---
@@ -3086,6 +3310,8 @@ class WindowsPage(Page):
         hw, want = c["hwnd"], (int(v[2]), int(v[3]))
 
         def check():
+            if self.app.closing:
+                return
             _, _, w_, h_ = win_rect(hw)
             if w_ > want[0] + 2 or h_ > want[1] + 2:
                 self.app.toast(f"Windows kept it at {w_}×{h_} (the minimum for a normal window). "
@@ -3386,6 +3612,8 @@ class MultiViewPage(Page):
         self.active = False
 
     def pulse(self):
+        if self.app.closing:
+            return
         if self.active:
             try:
                 self.sync()
@@ -3395,6 +3623,8 @@ class MultiViewPage(Page):
 
     def follow(self):
         """Keyboard focus goes to the stage window while the mouse is over it."""
+        if self.app.closing:
+            return
         busy = self.active and self.stage_pid is not None
         try:
             if busy and (user32.GetForegroundWindow() or 0) == (self.root() or 0):
@@ -3637,7 +3867,8 @@ class PerfPage(Page):
         self.automin.pack(anchor="w", pady=6)
         self.cw.append(self.automin)
         L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, a Windows job-object hard CPU cap, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written to each account's isolated profile (or, without isolation, while no client is running; a backup is kept).\n"
-              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target. The RAM limit is a hard working-set cap: Windows keeps at most that much of a client in physical memory and moves the rest to the page file, so very low limits make Roblox slow and disk-heavy.",
+              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target. The RAM limit is a hard working-set cap: Windows keeps at most that much of a client in physical memory and moves the rest to the page file, so very low limits make Roblox slow and disk-heavy.\n"
+              "When you close RoManager, every limit it applied to your running clients is taken off again.",
           11, muted=True, wraplength=900, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x")
@@ -4020,7 +4251,7 @@ class App(ctk.CTk):
             self.update_idletasks()
             self.lift()
             self.attributes("-topmost", True)
-            self.after(400, lambda: self.attributes("-topmost", self.core.db.flag("topmost")))
+            self.after(400, lambda: None if self.closing else self.attributes("-topmost", self.core.db.flag("topmost")))
             self.focus_force()
             hwnd = self.root_hwnd()
             if hwnd:
@@ -4171,7 +4402,8 @@ class App(ctk.CTk):
         self.after(1000 if self.state() == "iconic" else 100, self.pump)
 
     def ui(self, fn):
-        self.uiq.put(fn)
+        if not self.closing:
+            self.uiq.put(fn)
 
     def bg(self, work, done=None):
         def run():
@@ -4248,10 +4480,15 @@ class App(ctk.CTk):
 
     def on_close(self):
         """Closing the window ends RoManager completely: no leftover process, thread or login window.
-        (Roblox clients you launched keep running; they are separate programs.)"""
+        (Roblox clients you launched keep running; they are separate programs, but every limit RoManager
+        put on them is taken off first.)"""
         if self.closing:
             return
         self.closing = True
+        # watchdog: if anything below hangs (a locked database, a stuck driver call), the process still ends
+        wd = threading.Timer(5.0, lambda: os._exit(0))
+        wd.daemon = True
+        wd.start()
         mv = self.pages.get("MultiView")
         if mv:
             try:
@@ -4275,6 +4512,7 @@ class App(ctk.CTk):
 
 def _log_crash(text):
     try:
+        APPDIR.mkdir(parents=True, exist_ok=True)
         f = APPDIR / "crash.log"
         if f.exists() and f.stat().st_size > 200_000:
             f.unlink()
@@ -4290,16 +4528,14 @@ def install_crash_logging():
     threading.excepthook = lambda a: _log_crash("".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
 
 
+_SINGLE_INSTANCE_MUTEX = None
+
+
 def single_instance_guard():
-    """Stops a second RoManager.exe from starting as an invisible duplicate
-    process. Without this, double-clicking the exe while RoManager is
-    already running (or an autostart entry firing twice) spins up a second
-    process that never shows a window of its own - exactly the "runs in
-    the background instead of opening" symptom. Here the new process
-    detects the existing one, brings its window to the front, and exits.
-    This must only run on the normal app path - never for the --login
-    subprocess, which is a second process of the same exe spawned on
-    purpose and must be allowed to run alongside the main window."""
+    """Stops a second RoManager.exe from starting as an invisible duplicate process. The new process detects the
+    running one, brings its window to the front, and exits. This only runs on the normal app path - never for the
+    --login subprocess, which is a second process of the same exe spawned on purpose."""
+    global _SINGLE_INSTANCE_MUTEX
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     k.CreateMutexW.restype = ctypes.c_void_p
     k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
@@ -4311,7 +4547,7 @@ def single_instance_guard():
                 user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
         return False
-    globals()["_SINGLE_INSTANCE_MUTEX"] = mutex  # keep a reference alive for the life of the process
+    _SINGLE_INSTANCE_MUTEX = mutex  # keep it alive for the life of the process
     return True
 
 
@@ -4347,33 +4583,50 @@ def unlock(core):
 
 
 def main():
-    if "--login" in sys.argv:
+    if "--login" in sys.argv:  # the login window runs as its own short-lived process; it always ends in os._exit
         login_window()
-        return
+        os._exit(0)
     install_crash_logging()
     if not single_instance_guard():
-        return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-    try:
-        core = Core()
-    except Exception as e:
-        user32.MessageBoxW(0, f"Database unavailable:\n{e}", APP_NAME, 0x10)
-        return
-    apply_theme(core.db)
-    if core.db.get("lock_hash") and not unlock(core):
-        core.shutdown()
         os._exit(0)
-    sys.setswitchinterval(0.005)
-    core.start()
-    set_self_cap(core.db.num("app_cap", 5, 100))
-    App(core).mainloop()
-    # mainloop only returns when the window is gone: make sure nothing stays behind
+    core = None
     try:
-        core.shutdown()
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+        try:
+            core = Core()
+        except Exception as e:
+            _log_crash(f"Database unavailable: {e!r}")
+            user32.MessageBoxW(0, f"Database unavailable:\n{e}", APP_NAME, 0x10)
+            return
+        apply_theme(core.db)
+        if core.db.get("lock_hash") and not unlock(core):
+            return
+        sys.setswitchinterval(0.005)
+        core.start()
+        set_self_cap(core.db.num("app_cap", 5, 100))
+        App(core).mainloop()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        _log_crash(tb)
+        try:
+            user32.MessageBoxW(0, "RoManager hit an error and will close.\n\n" + tb[-900:] +
+                               f"\n\nDetails: {APPDIR / 'crash.log'}", APP_NAME, 0x10)
+        except Exception:
+            pass
     finally:
+        # whatever happened above, nothing of RoManager stays alive afterwards
+        wd = threading.Timer(5.0, lambda: os._exit(0))
+        wd.daemon = True
+        wd.start()
+        try:
+            if core is not None:
+                core.shutdown()
+        except Exception:
+            pass
         os._exit(0)
 
 
