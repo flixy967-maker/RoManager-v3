@@ -2,10 +2,15 @@
 RoManager - Roblox multi-account manager and multi-instance launcher (single file).
 Python 3.11+, Windows 10/11 x64.  Dependencies: customtkinter, psutil, Pillow, pywebview.
 
-Multi-instance works by creating and holding the singleton mutex that Roblox checks
-before it opens a new client, and (when Roblox is already running) by releasing that
-handle from the existing clients.  There is no instance-count limit: the only limit
-is what your PC can handle.
+Multi-instance works by creating and holding the singleton guard objects that Roblox
+checks before it opens a new client.  Clients that were already open before RoManager
+took the guard must be closed once; after that there is no instance-count limit except
+what your PC can handle.  RoManager never opens, duplicates or closes handles inside
+another process.
+
+Roblox clients open inside RoManager's Multi-View tiles by default, so the desktop stays
+clean.  The tile under the pointer runs at full speed; every other client keeps running
+in the background with reduced priority and Efficiency Mode.
 
 Not implemented (no fake buttons): tray icon, language packs, auto-updater,
 whole-file database encryption (secrets are DPAPI-encrypted per field), adopting
@@ -84,6 +89,7 @@ APP_NAME = "RoManager"
 APPDIR = Path(os.environ.get("APPDATA", ".")) / APP_NAME
 PROC_NAME = "RobloxPlayerBeta.exe"
 NCPU = psutil.cpu_count() or 1
+MAX_ACCOUNTS = 40  # supported ceiling for the account list, imports and launch queue
 READY = threading.Event()  # set once the main window has been verified visible
 
 
@@ -4259,7 +4265,7 @@ DEFAULTS = {
     "isolate": "0", "app_cap": "15", "ram_guard": "1", "relax_on": "1", "p_cap": "0",
     "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
     "mv_cols": "auto", "mv_tile": "auto", "mv_fill": "0", "mv_gap": "12", "mv_caps": "1", "mv_split": "76",
-    "mv_live": "0",
+    "mv_live": "1",
     "ui_iv": "1", "ui_pause": "1", "self_eco": "1", "self_eco_always": "0", "prev_on": "0", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
@@ -4311,6 +4317,11 @@ MIGRATIONS = [
     """BEGIN;
        UPDATE settings SET value='16' WHERE key='radius' AND value='18';
        UPDATE settings SET value='Obsidian' WHERE key='theme' AND (value IS NULL OR value='');
+       COMMIT;""",
+    # Interactive docking became the default: clients open inside the app instead of on the desktop.
+    """BEGIN;
+       INSERT INTO settings(key,value) VALUES('mv_live','1')
+       ON CONFLICT(key) DO UPDATE SET value='1' WHERE settings.value='0';
        COMMIT;""",
 ]
 
@@ -5274,123 +5285,13 @@ def roblox_exes():
     return [p for r in roots if r.exists() for p in r.glob("*/RobloxPlayerBeta.exe")]
 
 
-# ----------------------------------------------------- multi-instance unlock ---
-# Roblox's current singleton guard is the kernel object "ROBLOX_singletonEvent". Despite
-# its name it is treated as a mutex, so RoManager creates it as a mutex (without taking
-# ownership) before Roblox starts. Clients that are already open are unlocked the same
-# way Process Explorer's "close handle" does it: the singleton handle is closed inside
-# that Roblox process. Only that one handle is touched; nothing else in Roblox changes.
-class SYSTEM_HANDLE(ctypes.Structure):
-    _fields_ = [("ProcessId", wintypes.ULONG), ("ObjectTypeNumber", wintypes.BYTE),
-                ("Flags", wintypes.BYTE), ("Handle", wintypes.USHORT),
-                ("Object", ctypes.c_void_p), ("GrantedAccess", wintypes.DWORD)]
-
-
-class SYSTEM_HANDLE_INFORMATION(ctypes.Structure):
-    _fields_ = [("HandleCount", wintypes.ULONG), ("Handles", SYSTEM_HANDLE * 1)]
-
-
-class UNICODE_STRING(ctypes.Structure):
-    _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
-                ("Buffer", wintypes.LPWSTR)]
-
-
-_ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
-_NTSTATUS = ctypes.c_long
-_ntdll.NtQuerySystemInformation.restype = _NTSTATUS
-_ntdll.NtQuerySystemInformation.argtypes = [wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
-                                             ctypes.POINTER(wintypes.ULONG)]
-_ntdll.NtQueryObject.restype = _NTSTATUS
-_ntdll.NtQueryObject.argtypes = [ctypes.c_void_p, wintypes.ULONG, ctypes.c_void_p,
-                                 wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
-kernel32.DuplicateHandle.restype = wintypes.BOOL
-kernel32.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                                     ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD, wintypes.BOOL,
-                                     wintypes.DWORD]
-
-_SYSTEM_HANDLE_INFORMATION_CLASS = 16
-_PROCESS_DUP_HANDLE = 0x0040
-_PROCESS_QUERY_INFORMATION = 0x0400
-_DUPLICATE_SAME_ACCESS = 0x00000002
-_DUPLICATE_CLOSE_SOURCE = 0x00000001
-
-
-def _handle_name(handle):
-    """The NT object name behind a handle, or '' when Windows will not tell us."""
-    size = 2048
-    for _ in range(3):
-        buf = ctypes.create_string_buffer(size)
-        need = wintypes.ULONG(0)
-        st = _ntdll.NtQueryObject(handle, 1, buf, size, ctypes.byref(need))  # ObjectNameInformation
-        if st == 0:
-            us = UNICODE_STRING.from_buffer(buf)
-            if us.Buffer and us.Length:
-                return ctypes.wstring_at(us.Buffer, us.Length // 2)
-            return ""
-        if (st & 0xFFFFFFFF) != 0xC0000004:  # STATUS_INFO_LENGTH_MISMATCH
-            return ""
-        size = max(size, need.value + 64)
-    return ""
-
-
-def close_roblox_singleton_handles(pids=None, want=("roblox_singletonevent", "roblox_singletonmutex")):
-    """Close the Roblox singleton handle(s) inside Roblox client processes. This is the same
-    documented-by-observation unlock used by Process Explorer and common multi-instance tools.
-    Returns (closed_handles, processes_changed, note)."""
-    pids = set(roblox_pids() if pids is None else pids)
-    if not pids:
-        return 0, 0, ""
-    closed, touched, errors = 0, set(), []
-    base_len = 1024 * 1024
-    for pid in pids:
-        hproc = kernel32.OpenProcess(_PROCESS_DUP_HANDLE | _PROCESS_QUERY_INFORMATION, False, int(pid))
-        if not hproc:
-            continue
-        try:
-            size = base_len
-            for _ in range(6):  # grow if the system handle table does not fit
-                buf = ctypes.create_string_buffer(size)
-                need = wintypes.ULONG(0)
-                st = _ntdll.NtQuerySystemInformation(_SYSTEM_HANDLE_INFORMATION_CLASS, buf, size,
-                                                     ctypes.byref(need))
-                if (st & 0xFFFFFFFF) != 0xC0000004:
-                    break
-                size = max(size * 2, need.value + 65536)
-            else:
-                continue
-            if st != 0:
-                continue
-            base = ctypes.addressof(buf)
-            count = ctypes.c_ulong.from_address(base).value
-            off = ctypes.sizeof(SYSTEM_HANDLE_INFORMATION) - ctypes.sizeof(SYSTEM_HANDLE)
-            for i in range(min(count, 2_000_000)):
-                sh = SYSTEM_HANDLE.from_address(base + off + i * ctypes.sizeof(SYSTEM_HANDLE))
-                if sh.ProcessId != pid or not sh.Handle:
-                    continue
-                dup = ctypes.c_void_p()
-                if not kernel32.DuplicateHandle(hproc, ctypes.c_void_p(sh.Handle),
-                                                kernel32.GetCurrentProcess(), ctypes.byref(dup),
-                                                0, False, _DUPLICATE_SAME_ACCESS) or not dup.value:
-                    continue
-                try:
-                    name = _handle_name(dup).lower()
-                finally:
-                    kernel32.CloseHandle(dup)
-                if name and any(w in name for w in want):
-                    dummy = ctypes.c_void_p()
-                    if kernel32.DuplicateHandle(hproc, ctypes.c_void_p(sh.Handle),
-                                                kernel32.GetCurrentProcess(), ctypes.byref(dummy),
-                                                0, False, _DUPLICATE_CLOSE_SOURCE):
-                        if dummy.value:
-                            kernel32.CloseHandle(dummy)
-                        closed += 1
-                        touched.add(pid)
-                    else:
-                        errors.append(f"PID {pid}: Windows error {ctypes.GetLastError()}")
-        finally:
-            kernel32.CloseHandle(hproc)
-    note = ", ".join(errors[:2])
-    return closed, len(touched), note
+# ------------------------------------------------------ multi-instance guard ---
+# Roblox's singleton guard is the kernel object pair "ROBLOX_singletonMutex" and
+# "ROBLOX_singletonEvent". Normally a second launch signals that event so the first client
+# closes itself. RoManager creates and holds both objects in its own process before any
+# client starts, so every client sees the guard as already taken and simply runs as a
+# secondary instance. Nothing is opened, duplicated or closed inside Roblox processes.
+SINGLETON_NAMES = (("mutex", "ROBLOX_singletonMutex"), ("event", "ROBLOX_singletonEvent"))
 
 
 # ------------------------------------------------------------------ core ---
@@ -5422,7 +5323,8 @@ class Core:
         self.holder = None
         self.multi_lock = threading.Lock()  # set_multi can be called from the start-up thread and the launch queue
         self.multi_status = "Multi-instance is off."
-        self.unlock_status = ""
+        self.guard_prior = {}  # pid -> create_time of clients that existed before the guard was created
+        self.windowq = collections.deque()  # pids whose Roblox window just appeared; the UI docks them
         self.last_net = None
         self.qs = {"running": False, "total": 0, "done": 0, "failed": 0}
         self.pause_ev = threading.Event()
@@ -5456,7 +5358,7 @@ class Core:
             threading.Thread(target=self._release_leftovers, args=(leftovers,), daemon=True).start()
         threading.Thread(target=self.sample_loop, daemon=True).start()
         threading.Thread(target=self.gpu_loop, daemon=True).start()
-        # multi-instance setup can take a moment and may scan handles; it must never delay the window
+        # multi-instance setup creates two kernel objects; it must never delay the window
         if self.db.flag("multi"):
             threading.Thread(target=self._init_multi, daemon=True).start()
 
@@ -5515,7 +5417,8 @@ class Core:
 
     def _init_multi(self):
         try:
-            self.log(self.set_multi(True))
+            msg = self.set_multi(True)
+            self.log(msg, "warn" if self.stale_clients() else None)
         except Exception as e:
             self.log(f"Multi-instance setup failed: {e}")
 
@@ -5540,6 +5443,8 @@ class Core:
                 h["stop"].set()
             self.holder = None
             self.mutex = None
+            self.guard_prior = {}
+            self.windowq.clear()
         except Exception:
             pass
         try:
@@ -5573,10 +5478,10 @@ class Core:
 
     # -- multi-instance (holds Roblox's singleton objects in OUR process)
     def _hold(self, info):
-        """Owns the kernel objects Roblox uses as its single-instance guard, from one long-lived thread.
-        They are created as MUTEXES without ownership (the object name is 'ROBLOX_singletonEvent', despite
-        the name). If Roblox clients are already open, their singleton handle is released first, exactly
-        like Process Explorer's 'Close Handle'. That is what lets an unlimited number of clients start."""
+        """Owns the two kernel objects Roblox uses as its single-instance guard, from one long-lived
+        thread. Holding both names in this process makes every client that starts afterwards a
+        secondary instance, so clients stop closing each other. This never opens, duplicates or
+        closes a handle inside another process."""
         res = info["res"]
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.CreateMutexW.restype = ctypes.c_void_p
@@ -5584,29 +5489,27 @@ class Core:
         k.CreateEventW.restype = ctypes.c_void_p
         k.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
         k.CloseHandle.argtypes = [ctypes.c_void_p]
+        prior = {}
+        for pid in roblox_pids():
+            try:
+                prior[pid] = psutil.Process(pid).create_time()
+            except psutil.Error:
+                prior[pid] = 0.0
+        res["prior"] = prior
+        holders = []
         try:
-            closed, touched, note = close_roblox_singleton_handles()
-            res["closed"], res["touched"], res["note"] = closed, touched, note
-        except Exception as e:
-            res["closed"], res["touched"], res["note"] = 0, 0, str(e)
-        holders, existing = [], False
-        try:
-            # Roblox checks BOTH names. The mutex is the real singleton guard; the event is a
-            # manual-reset event that is never signalled. Create each with its correct type.
-            for kind, name in (("mutex", "ROBLOX_singletonMutex"), ("event", "ROBLOX_singletonEvent")):
+            # Roblox checks BOTH names. The mutex is its real singleton guard; the event is a
+            # manual-reset event that carries the "please close" signal between clients.
+            for kind, name in SINGLETON_NAMES:
                 if kind == "mutex":
-                    h = k.CreateMutexW(None, True, name)
+                    h = k.CreateMutexW(None, True, name)  # own it, so no client can become primary
                 else:
                     h = k.CreateEventW(None, True, False, name)
-                err = ctypes.get_last_error()
                 if not h:
-                    res["msg"] = f"Windows would not create '{name}' (error {err})."
+                    res["msg"] = f"Windows would not create '{name}' (error {ctypes.get_last_error()})."
                     break
                 holders.append(h)
-                existing = existing or err == 183  # ERROR_ALREADY_EXISTS: a running copy still holds it
-            else:
-                res["ok"] = True
-                res["existing"] = existing
+            res["ok"] = len(holders) == len(SINGLETON_NAMES)
         finally:
             if not res.get("ok"):
                 for h in holders:
@@ -5614,36 +5517,70 @@ class Core:
         info["ready"].set()
         if res.get("ok"):
             info["stop"].wait()
-        for h in holders:
-            k.CloseHandle(h)
+            for h in holders:
+                k.CloseHandle(h)
 
-    def _unlock_new_client(self, pid):
-        """New Roblox versions may create their singleton handle a few seconds after the window opens.
-        Close it there (and every time it comes back for a short while) so the next launch is never
-        blocked and an old client is not asked to close itself."""
-        def run():
-            misses = 0
-            for _ in range(7):
-                if self.stop or not psutil.pid_exists(pid):
-                    return
-                try:
-                    closed, _touched, _note = close_roblox_singleton_handles({pid})
-                except Exception:
-                    return
-                if closed:
-                    misses = 0
-                    self.log(f"Multi-instance: released {closed} singleton handle(s) in the new client "
-                             f"(PID {pid}).")
-                else:
-                    misses += 1
-                    if misses >= 3:
-                        return
-                time.sleep(1.2)
-        threading.Thread(target=run, daemon=True).start()
+    def stale_clients(self):
+        """Roblox clients that were already open when the guard was created. One of these can still
+        be the primary instance, and Roblox closes the primary when a secondary launches."""
+        out = []
+        for pid, born in list(self.guard_prior.items()):
+            try:
+                p = psutil.Process(pid)
+                if not born or abs(p.create_time() - born) < 0.02:
+                    out.append(pid)
+            except psutil.Error:
+                pass
+        return sorted(out)
+
+    def multi_clean(self):
+        return bool(self.mutex) and not self.stale_clients()
+
+    def close_stale(self, pids=None):
+        """Close only clients that predate the guard, with normal process termination. Called after
+        the user confirms it on the Play tab; no handles are touched inside Roblox."""
+        pids = self.stale_clients() if pids is None else list(pids)
+        done = 0
+        for pid in pids:
+            try:
+                p = psutil.Process(pid)
+                if "robloxplayerbeta" not in (p.name() or "").lower():
+                    continue
+                p.terminate()
+                done += 1
+            except psutil.Error:
+                pass
+        end = time.time() + 10
+        while time.time() < end and any(psutil.pid_exists(p) for p in pids):
+            time.sleep(0.2)
+        for pid in pids:  # a hung client must not keep the old singleton owner alive
+            try:
+                p = psutil.Process(pid)
+                if p.is_running():
+                    p.kill()
+            except psutil.Error:
+                pass
+        if done:
+            self.log(f"Closed {done} Roblox client(s) that were open before the multi-instance guard.", "warn")
+        return done
 
     def set_multi(self, on):
         with self.multi_lock:
             return self._set_multi(on)
+
+    def _multi_text(self):
+        older = self.stale_clients()
+        if older:
+            return (f"Multi-instance ON, but {len(older)} Roblox client(s) were already open before the guard. "
+                    f"Roblox will close them when the next account starts. Use \"Fix multi-instance\" once to "
+                    f"close them and start clean.")
+        return ("Multi-instance ON: every account can open its own client. The singleton guard is held by "
+                "RoManager.")
+
+    def refresh_multi_status(self):
+        if self.mutex:
+            self.multi_status = self._multi_text()
+        return self.multi_status
 
     def _set_multi(self, on):
         if not on:
@@ -5651,30 +5588,39 @@ class Core:
                 self.holder["stop"].set()
                 self.holder = None
             self.mutex = None
+            self.guard_prior = {}
             self.multi_status = "Multi-instance is off."
             return self.multi_status
         if self.holder:
-            return self.multi_status
+            return self.refresh_multi_status()
         info = {"stop": threading.Event(), "ready": threading.Event(), "res": {}}
         threading.Thread(target=self._hold, args=(info,), daemon=True).start()
-        info["ready"].wait(25)  # already-running clients may need a handle scan first
+        info["ready"].wait(12)
         if info["res"].get("ok"):
             self.holder, self.mutex = info, True
-            closed, touched = info["res"].get("closed", 0), info["res"].get("touched", 0)
-            self.unlock_status = (f"Released the singleton handle from {touched} already-running client(s)."
-                                  if closed else "")
-            self.multi_status = ("Multi-instance ON: every account can open its own client. "
-                                 + (self.unlock_status or "The singleton guard is held by RoManager."))
+            self.guard_prior = dict(info["res"].get("prior") or {})
+            self.multi_status = self._multi_text()
         else:
             info["stop"].set()
             self.mutex = None
+            self.guard_prior = {}
             self.multi_status = info["res"].get("msg", "Could not start multi-instance.")
         return self.multi_status
+
+    def ensure_multi(self):
+        """Make sure the guard exists before a client is started. Returns True when it is held."""
+        if self.mutex:
+            return True
+        self.log(self.set_multi(True))
+        return bool(self.mutex)
 
     # -- launching
     def launch_one(self, aid, dest):
         if not roblox_installed():
             raise RuntimeError("Roblox Player is not installed for this Windows user.")
+        if self.db.flag("multi") and not self.ensure_multi():
+            raise RuntimeError("The multi-instance guard could not be created, so another client would close this "
+                               "one. Close every Roblox window and try again.")
         acc = self.db.one("SELECT * FROM accounts WHERE id=?", (aid,))
         if not acc:
             raise RuntimeError("Account no longer exists.")
@@ -5705,7 +5651,6 @@ class Core:
         self.db.q("UPDATE accounts SET last_used=?, status='Valid' WHERE id=?", (time.time(), aid))
         threading.Thread(target=self.apply_when_ready, args=(pid,), daemon=True).start()
         return pid
-
     def _start_client(self, acc, cookie, dest, isolated):
         ticket = auth_ticket(cookie)  # tickets are single-use, so every attempt asks for a fresh one
         before = roblox_pids()
@@ -5721,18 +5666,23 @@ class Core:
                 tracked = set(self.clients)
             new = roblox_pids() - before - tracked
             if new:
-                pid = min(new)
-                self._unlock_new_client(pid)
-                return pid
+                return min(new)
         return None
 
     def _check_kill(self, others, name):
         if self.stop:
             return
         dead = [p for p in others if not psutil.pid_exists(p)]
-        if dead:
-            self.log(f"{len(dead)} other client(s) closed when {name} started, so Roblox's single-instance lock is "
-                     f"still active. Status: {self.multi_status}", "bad")
+        if not dead:
+            return
+        if self.stale_clients():
+            self.log(f"{len(dead)} older client(s) closed when {name} started. They were open before RoManager's "
+                     f"guard, so Roblox treated one of them as the primary instance. Close every Roblox window "
+                     f"once, then launch again: clients started after the guard stay open together.", "bad")
+        else:
+            self.log(f"{len(dead)} client(s) closed when {name} started even though the guard is held. Close every "
+                     f"Roblox window, press Launch again, and check that no other multi-instance tool is running.",
+                     "bad")
 
     def resolve_dest(self, cookie, dest):
         if dest.get("share_code") and not dest.get("place_id"):
@@ -5785,6 +5735,12 @@ class Core:
     def _queue(self, ids, dest, delay):
         if not self.mutex:
             self.log(self.set_multi(True))
+        if not self.mutex:
+            self.qs.update(running=False)
+            self.log("Launch queue stopped: the multi-instance guard could not be created.", "bad")
+            self.notify("launch", "Launch cancelled: the multi-instance guard could not be created.")
+            return
+        ids = ids[:MAX_ACCOUNTS]
         self.apply_global_perf()
         for i, aid in enumerate(ids):
             self.pause_ev.wait()
@@ -6011,7 +5967,7 @@ class Core:
         # Multi-View tile only counts as foreground while the pointer is over that tile; the rest keep running,
         # but in the background, so nine clients stay responsive together.
         if c.get("embedded"):
-            front = True
+            front = not c.get("mv_stage_bg")  # the stage client runs in the background while another tab covers it
         elif c.get("mv_embed"):
             front = bool(c.get("mv_focus"))
         else:
@@ -6113,6 +6069,8 @@ class Core:
             w = find_windows({pid})
             if pid in w:
                 c["hwnd"] = w[pid]
+                if self.db.flag("mv_live"):
+                    self.windowq.append(pid)  # the UI docks it into its tile immediately
                 break
             time.sleep(1)
         self.tune_all()
@@ -7685,7 +7643,7 @@ class HomePage(Page):
 # -------------------------------------------------------------- Accounts ---
 class AccountsPage(Page):
     def __init__(self, parent, app):
-        super().__init__(parent, app, "Accounts", "Log in, organise, and select the accounts you want to run")
+        super().__init__(parent, app, "Accounts", "Log in, organise and run your fleet  ·  maximum 40 accounts")
         self.vars, self.frames, self.avatars_ui = {}, {}, {}
         btn(self.actions, "＋  Log in to add", self.add_login, "accent", w=142, h=38).pack(side="left", padx=4)
         btn(self.actions, "Import cookie", self.add_cookie, "ghost", w=118, h=38).pack(side="left", padx=4)
@@ -7850,12 +7808,13 @@ class AccountsPage(Page):
         rows = self.core.db.all("SELECT alias, username, is_main, status FROM accounts")
         n = len(rows)
         sel = len(self.app.selected)
-        self.count.configure(text=f"{n} account(s)   ·   {sel} selected")
+        self.count.configure(text=f"{n} / {MAX_ACCOUNTS} accounts   ·   {sel} selected")
         try:
             main = next((r["alias"] or r["username"] for r in rows if r["is_main"]), "Not set")
             valid = sum(1 for r in rows if r["status"] == "Valid")
             groups = self.core.db.one("SELECT COUNT(*) FROM groups")[0]
-            self.sumv["total"].configure(text=str(n))
+            self.sumv["total"].configure(text=f"{n} / {MAX_ACCOUNTS}",
+                                         text_color=WARN if n >= MAX_ACCOUNTS else T["text"])
             self.sumv["selected"].configure(text=str(sel), text_color=T["lav"] if sel else T["text"])
             self.sumv["groups"].configure(text=str(groups))
             self.sumv["main"].configure(text=main, text_color=T["text"] if main != "Not set" else T["muted"])
@@ -7909,9 +7868,21 @@ class AccountsPage(Page):
             self.core.db.q("UPDATE accounts SET cookie_enc=?, status='Valid', robux=?, username=? WHERE id=?",
                            (enc, rb, me["name"], row[0]))
             return "updated"
+        if self.at_limit():
+            raise RuntimeError(self.limit_text())
         self.core.db.q("INSERT INTO accounts(user_id,username,cookie_enc,status,robux,created) VALUES(?,?,?,?,?,?)",
                        (me["id"], me["name"], enc, "Valid", rb, time.time()))
         return "added"
+
+    def account_count(self):
+        return self.core.db.one("SELECT COUNT(*) FROM accounts")[0]
+
+    def at_limit(self):
+        return self.account_count() >= MAX_ACCOUNTS
+
+    def limit_text(self):
+        return (f"RoManager supports up to {MAX_ACCOUNTS} accounts. Remove an account before adding another, "
+                f"or refresh the session of an account that is already in the list.")
 
     # --- add: username + password (typed into the real Roblox login page) / browser login
     def add_login(self):
@@ -7964,7 +7935,11 @@ class AccountsPage(Page):
                 alert(self.app, "Login verification failed", f"Login worked but verification failed: {e}", "bad")
                 return
             me, rb = res
-            r = self.store(cookie, me, rb)
+            try:
+                r = self.store(cookie, me, rb)
+            except RuntimeError as err:
+                alert(self.app, "Account limit reached", str(err), "warn")
+                return
             if pw:
                 self.core.db.q("UPDATE accounts SET pw_enc=? WHERE user_id=?", (dpapi_protect(pw.encode()), me["id"]))
             self.rebuild()
@@ -8032,7 +8007,11 @@ class AccountsPage(Page):
                 if err:
                     status.configure(text=str(err), text_color=BAD)
                     return
-                r = self.store(raw, res[0], res[1])
+                try:
+                    r = self.store(raw, res[0], res[1])
+                except RuntimeError as e:
+                    status.configure(text=str(e), text_color=WARN)
+                    return
                 top.destroy()
                 self.rebuild()
                 self.app.toast(f"{r.capitalize()} {res[0]['name']}", "ok")
@@ -8071,29 +8050,35 @@ class AccountsPage(Page):
 
             def run():
                 added = updated = 0
-                failed = []
+                failed, skipped = [], []
                 for i, ck_ in enumerate(cookies, 1):
                     self.app.ui(lambda i=i: status.configure(text=f"Checking {i}/{len(cookies)}…", text_color=T["muted"]))
                     try:
                         me = whoami(ck_)
+                        exists = self.core.db.one("SELECT 1 FROM accounts WHERE user_id=?", (me["id"],))
+                        if not exists and self.at_limit():
+                            skipped.append(f"#{i}: {me['name']} skipped - the {MAX_ACCOUNTS}-account limit was reached")
+                            continue
                         r = self.store(ck_, me, get_robux(ck_, me["id"]))
                         added += r == "added"
                         updated += r == "updated"
                     except Exception as e:
                         failed.append(f"#{i}: {e}")
                     time.sleep(0.4)
-                return added, updated, failed
+                return added, updated, failed, skipped
 
             def done(res, err):
                 go_btn.configure(state="normal")
                 if err:
                     status.configure(text=str(err), text_color=BAD)
                     return
-                a, u_, f_ = res
-                msg = f"Added {a}, refreshed {u_}, failed {len(f_)}."
+                a, u_, f_, sk = res
+                msg = f"Added {a}, refreshed {u_}, skipped {len(sk)}, failed {len(f_)}."
+                if sk:
+                    msg += "\n" + "\n".join(sk[:3])
                 if f_:
                     msg += "\n" + "\n".join(f_[:4])
-                status.configure(text=msg, text_color=OK if not f_ else WARN)
+                status.configure(text=msg, text_color=OK if not f_ and not sk else WARN)
                 self.rebuild()
 
             self.app.bg(run, done)
@@ -8356,16 +8341,13 @@ class PlayPage(Page):
             pass
 
     def fix_multi(self):
-        if roblox_pids() and confirm(self.app, "Close Roblox and retry?",
-                                     self.core.multi_status + "\n\nClose every running Roblox window now and retry "
-                                     "multi-instance? Unsaved in-game progress will be lost.", danger=True):
-            for p in roblox_pids():
-                try:
-                    psutil.Process(p).terminate()
-                except psutil.Error:
-                    pass
-            time.sleep(2)
+        pids = roblox_pids()
+        if pids and confirm(self.app, "Close Roblox and retry?",
+                            self.core.multi_status + "\n\nClose every running Roblox window now and retry "
+                            "multi-instance? Unsaved in-game progress will be lost.", danger=True):
+            self.core.close_stale(pids)
         self.core.log(self.core.set_multi(True))
+        self.refresh()
 
     def fav(self):
         try:
@@ -8393,8 +8375,23 @@ class PlayPage(Page):
         if not ids:
             self.err.configure(text="Select at least one account on the Accounts tab.")
             return
+        if not self.core.ensure_multi():
+            self.err.configure(text="Multi-instance could not start. Close every Roblox window and try again.")
+            return
+        older = self.core.stale_clients()
+        if older:
+            if not confirm(self.app, f"Close {len(older)} older Roblox client(s)?",
+                           "These clients were opened before RoManager's multi-instance guard. Roblox closes the "
+                           "primary client when the next account starts, which is why some clients disappeared. "
+                           "Close them now and launch cleanly? Unsaved in-game progress in them will be lost.",
+                           danger=True):
+                self.err.configure(text="Close the older Roblox windows first, then press Launch.")
+                return
+            self.core.close_stale(older)
         try:
             self.core.start_queue(ids, d, float(self.delay.get()))
+            if self.core.db.flag("mv_live"):
+                self.app.show("MultiView")  # clients open in their tiles, not as desktop windows
         except RuntimeError as e:
             self.err.configure(text=str(e))
 
@@ -8415,14 +8412,17 @@ class PlayPage(Page):
         L(box, sub, 9, muted=True, wraplength=300, justify="center").pack()
 
     def refresh(self):
-        self.multi_lbl.configure(text=self.core.multi_status, text_color=OK if self.core.mutex else WARN)
+        self.core.refresh_multi_status()
+        older = self.core.stale_clients()
+        self.multi_lbl.configure(text=self.core.multi_status,
+                                 text_color=OK if self.core.mutex and not older else WARN)
         try:
             self.mode_pill.configure(text="  MULTI-INSTANCE ACTIVE  " if self.core.mutex else "  MULTI-INSTANCE OFF  ",
                                      text_color=OK if self.core.mutex else WARN,
                                      fg_color=blend(OK if self.core.mutex else WARN, T["panel"], .14))
         except Exception:
             pass
-        if self.core.mutex:
+        if self.core.mutex and not older:
             self.fix.pack_forget()
         elif not self.fix.winfo_ismapped():
             self.fix.pack(anchor="w", pady=(4, 0))
@@ -8436,7 +8436,7 @@ class PlayPage(Page):
             dest_ok = False
         self._ready("accounts", bool(names), "ok" if names else "warn")
         self._ready("iso", True, "ok" if self.core.db.flag("isolate") else "muted")
-        self._ready("multi", bool(self.core.mutex), "ok" if self.core.mutex else "warn")
+        self._ready("multi", bool(self.core.mutex), "ok" if self.core.mutex and not older else "warn")
         try:
             ready = dest_ok and bool(names) and bool(self.core.mutex)
             self.ready_live.configure(text="READY TO LAUNCH" if ready else "CHECK THE DOTS",
@@ -8701,12 +8701,13 @@ class MultiViewPage(Page):
     COL_LABELS = ["Auto", "1", "2", "3", "4", "5", "6"]
 
     def __init__(self, parent, app):
-        super().__init__(parent, app, "Multi-View", "Live previews of every client. Play them in the tiles or on the stage.")
+        super().__init__(parent, app, "Multi-View", "Every client opens inside its tile. Hover one for full speed; the rest keep running in the background.")
         self.cfg = self.load_cfg()
         self.tiles, self.thumbs, self.orig, self.tile_saved = {}, {}, {}, {}
         self.stage_pid = self.stage_saved = None
         self.active, self._job, self._order = False, None, None
         self.focus_pid, self.embed_failed = None, set()
+        self.releasing = False  # set when the app hands every window back for shutdown
         self._focus_hold = 0.0
         self._kb_hwnd, self._stage_key = 0, False
         self._kb_tid = 0
@@ -8762,15 +8763,12 @@ class MultiViewPage(Page):
     def reset_cfg(self):
         was_live = bool(self.cfg.get("live"))
         self.cfg = {"cols": "auto", "tile": "auto", "fill": False, "gap": 12, "caps": True, "split": 76,
-                    "live": False}
+                    "live": was_live}
         for k, v in self.cfg.items():
             self.core.db.set("mv_" + k, ("1" if v else "0") if isinstance(v, bool) else str(v))
         self.core.db.set("mv_w", 320)
         self.core.db.set("mv_h", 180)
         self.update_live_btn()
-        if was_live and self.active:
-            self.unembed_all(repark=True)
-            self.refresh()
         self.schedule()
 
     def update_live_btn(self):
@@ -8784,6 +8782,7 @@ class MultiViewPage(Page):
 
     def set_live(self, on):
         on = bool(on)
+        self.releasing = False
         if on == bool(self.cfg.get("live")):
             self.update_live_btn()
             return
@@ -8791,13 +8790,11 @@ class MultiViewPage(Page):
         self.core.db.set("mv_live", "1" if on else "0")
         self.update_live_btn()
         if on:
-            if self.active:
-                self.embed_all()
-            self.app.toast("Roblox now runs inside the tiles. Hover a tile to give it full speed.", "ok")
+            self.embed_all()
+            self.app.toast("Roblox now runs inside RoManager. Hover a tile to give it full speed.", "ok")
         else:
-            if self.active:
-                self.unembed_all(repark=True)
-                self.refresh()
+            self.unembed_all(repark=True)
+            self.refresh()
             self.app.toast("Tiles are previews again. Click one to play it on the stage.", "info")
         self.schedule()
 
@@ -8835,14 +8832,14 @@ class MultiViewPage(Page):
         sw.pack(anchor="w", padx=8, pady=6)
 
         L(body, "I N T E R A C T I V E", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(12, 4))
-        sw_live = SW(body, "Run Roblox inside the tiles")
+        sw_live = SW(body, "Open Roblox inside RoManager")
         if self.cfg.get("live"):
             sw_live.select()
         sw_live.configure(command=lambda: self.set_live(bool(sw_live.get())))
         sw_live.pack(anchor="w", padx=8, pady=6)
-        L(body, "Each tile hosts its real client, so you can click and play without a separate window. Only the "
-                "tile under the pointer gets full CPU; the others keep running in the background at reduced "
-                "priority. Leaving the tab gives the windows back to your desktop. Previews are cheaper.",
+        L(body, "Each tile hosts its real client, so you can click and play without a separate desktop window. "
+                "Clients stay docked here when you switch tabs. Only the tile under the pointer gets full CPU; "
+                "every other client keeps running in the background at reduced priority. Previews are cheaper.",
           10, muted=True, wraplength=470, justify="left").pack(anchor="w", padx=8, pady=(2, 6))
 
         L(body, "P R E V I E W", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(12, 4))
@@ -8894,7 +8891,7 @@ class MultiViewPage(Page):
 
     # ---- interactive tiles: the real client is re-parented into its preview frame
     def live_on(self):
-        return bool(self.active and self.cfg.get("live"))
+        return bool(self.cfg.get("live")) and not self.releasing
 
     def embed_tile(self, pid):
         if not self.live_on():
@@ -8929,6 +8926,7 @@ class MultiViewPage(Page):
         self.tile_saved[pid] = saved
         c["mv_embed"] = True
         c["mv_focus"] = pid == self.focus_pid
+        c["mv_stage_bg"] = False
         c["tuned"] = None
         t["lab"].place_forget()
         t["pill"].configure(text=" Playing ", text_color=OK, fg_color=blend(OK, T["panel"], .16))
@@ -8952,6 +8950,7 @@ class MultiViewPage(Page):
         if c:
             c["mv_embed"] = False
             c["mv_focus"] = False
+            c["mv_stage_bg"] = False
             c["tuned"] = None
             if self._kb_hwnd == hwnd:
                 self.release_keyboard()
@@ -8972,6 +8971,7 @@ class MultiViewPage(Page):
             if c.get("mv_embed"):
                 c["mv_embed"] = False
                 c["mv_focus"] = False
+                c["mv_stage_bg"] = False
                 c["tuned"] = None
         self.focus_pid = None
         self.release_keyboard()
@@ -9021,7 +9021,7 @@ class MultiViewPage(Page):
 
     def track_focus(self):
         try:
-            if self.live_on():
+            if self.active and self.live_on():
                 hot, hot_hwnd = None, 0
                 root = self.root()
                 fg = user32.GetForegroundWindow() or 0
@@ -9033,7 +9033,7 @@ class MultiViewPage(Page):
                             c = cl.get(pid)
                             if not (c and c.get("mv_embed")):
                                 continue
-                            f = t["frame"]
+                            f = t["view"]
                             x, y = f.winfo_rootx(), f.winfo_rooty()
                             if x <= pt.x < x + max(1, f.winfo_width()) and \
                                     y <= pt.y < y + max(1, f.winfo_height()):
@@ -9090,7 +9090,7 @@ class MultiViewPage(Page):
             dwmapi.DwmUnregisterThumbnail(th)
 
     def sync(self):
-        if not self.active:
+        if not (self.active or self.live_on()):
             return
         fill = bool(self.cfg.get("fill"))
         origin = POINT(0, 0)
@@ -9111,6 +9111,8 @@ class MultiViewPage(Page):
                 if self.embed_tile(pid):
                     self.drop_thumb(pid)
                     continue
+            if not self.active:  # hidden docking page: never paint thumbnails over the visible tab
+                continue
             if t.get("fill") != fill:  # switching aspect modes is cleanest with a fresh thumbnail registration
                 self.drop_thumb(pid)
                 t["fill"] = fill
@@ -9267,6 +9269,8 @@ class MultiViewPage(Page):
         self.drop_thumb(pid)
         self.park(c)
         self.stage_pid = pid
+        c["mv_stage_bg"] = False
+        c["tuned"] = None
         self.back.pack(side="left", padx=4)
         self.layout()
         try:
@@ -9289,6 +9293,8 @@ class MultiViewPage(Page):
             release_window(c["hwnd"], self.stage_saved)
         if c:
             c["embedded"] = False
+            c["mv_stage_bg"] = False
+            c["tuned"] = None
             if self._kb_hwnd == c["hwnd"]:
                 self.release_keyboard()
         self._stage_key = False
@@ -9329,6 +9335,7 @@ class MultiViewPage(Page):
         self._stage_key = False
 
     def release_all(self):
+        self.releasing = True
         self.restore_all()
         self.active = False
 
@@ -9339,22 +9346,43 @@ class MultiViewPage(Page):
         self.app.toast("Windows are back on your desktop. Leave this tab and come back to preview them again.", "info")
 
     def on_enter(self):
+        self.releasing = False
         self.active = True
+        for c in self.core.snapshot():
+            if c.get("mv_stage_bg"):
+                c["mv_stage_bg"] = False
+                c["tuned"] = None
         self.after(60, self.schedule)
         if self.cfg.get("live"):
             self.after(220, self.embed_all)
 
     def on_leave(self):
-        self.restore_all()
+        was_live = self.live_on()
         self.active = False
+        if was_live:
+            # Keep every client docked inside RoManager. Nothing is put back on the desktop; the
+            # clients simply keep running in the background while another tab is visible.
+            self.focus_pid = None
+            self._focus_hold = 0.0
+            self._stage_key = False
+            self.release_keyboard()
+            self.apply_focus()
+            for c in self.core.snapshot():
+                if c.get("embedded"):
+                    c["mv_stage_bg"] = True
+                    c["tuned"] = None
+            self.app.bg(self.core.tune_all)
+        else:
+            self.restore_all()
 
     def pulse(self):
-        if self.active:
+        if self.active or self.live_on():
             try:
+                self.refresh()
                 self.sync()
             except Exception:
                 pass
-        self.after(1000, self.pulse)
+        self.after(900, self.pulse)
 
     def follow(self):
         """Keyboard focus goes to the stage window while the mouse is over it."""
@@ -9484,7 +9512,8 @@ class MultiViewPage(Page):
             self.empty.place(relx=0.5, rely=0.45, anchor="center")
         for c in cl:
             t = self.tiles[c["pid"]]
-            if self.active and c["hwnd"] and not t["detached"] and not c.get("embedded") and not c.get("mv"):
+            if self.active and not self.live_on() and c["hwnd"] and not t["detached"] \
+                    and not c.get("embedded") and not c.get("mv"):
                 self.park(c)
                 changed = True
             if self.live_on() and c["hwnd"] and not t["detached"] and not c.get("embedded") \
@@ -9503,7 +9532,7 @@ class MultiViewPage(Page):
             else:
                 txt, col = "Live", OK
             t["pill"].configure(text=f" {txt} ", text_color=col, fg_color=blend(col, T["panel"], .16))
-        if changed and self.active:
+        if changed and (self.active or self.live_on()):
             self.schedule()
 
 
@@ -10866,6 +10895,13 @@ class App(ctk.CTk):
                    "MultiView": MultiViewPage, "Monitor": MonitorPage, "Performance": PerfPage,
                    "Settings": SettingsPage}
         self.pages = LazyPages(self, classes)
+        if self.core.db.flag("mv_live"):
+            try:
+                # Build the docking surface up front, so a client launched from any tab has a tile
+                # ready and can be moved inside the app immediately.
+                self.pages["MultiView"]
+            except Exception as e:
+                self.core.log(f"Multi-View could not be prepared: {e}")
 
     def toggle_sidebar(self):
         db = self.core.db
@@ -11283,7 +11319,27 @@ class App(ctk.CTk):
                     self.core.log(f"UI error: {e}")
         except queue.Empty:
             pass
+        while self.core.windowq:
+            try:
+                pid = self.core.windowq.popleft()
+            except IndexError:
+                break
+            try:
+                self._dock_client(pid)
+            except Exception as e:
+                self.core.log(f"UI error: {e}")
         self.after(1000 if self.state() == "iconic" else 100, self.pump)
+
+    def _dock_client(self, pid):
+        """Move a just-started client from the desktop into its Multi-View tile."""
+        if self._closing or not self.core.db.flag("mv_live"):
+            return
+        mv = self.pages.get("MultiView")
+        if mv is None:
+            return
+        mv.refresh()
+        mv.layout()
+        mv.embed_tile(pid)
 
     def ui(self, fn):
         self.uiq.put(fn)
