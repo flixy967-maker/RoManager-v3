@@ -4256,7 +4256,10 @@ DEFAULTS = {
     "c_prio": "Normal", "c_w": "0", "c_h": "0", "c_automin": "0",
     "p_eco": "0", "p_cores": "0", "p_bg": "0", "p_trim": "0", "p_mem": "0",
     "p_gpu": "default", "p_gfx": "0", "p_fps": "0", "p_gpucap": "0", "p_ramcap": "0",
-    "isolate": "0", "app_cap": "15", "ram_guard": "1", "relax_on": "1", "p_cap": "0", "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
+    "isolate": "0", "app_cap": "15", "ram_guard": "1", "relax_on": "1", "p_cap": "0",
+    "mv_w": "320", "mv_h": "180", "mv_pw": "960", "mv_ph": "540",
+    "mv_cols": "auto", "mv_tile": "auto", "mv_fill": "0", "mv_gap": "12", "mv_caps": "1", "mv_split": "76",
+    "mv_live": "0",
     "ui_iv": "1", "ui_pause": "1", "self_eco": "1", "self_eco_always": "0", "prev_on": "0", "prev_iv": "5",
     # discord / security
     "webhook": "", "wh_on": "0", "n_crash": "1", "n_hung": "1", "n_restart": "1", "n_launch": "1",
@@ -4946,23 +4949,37 @@ class MEM_PRIO(ctypes.Structure):
 PRIO = {"Normal": psutil.NORMAL_PRIORITY_CLASS, "Below normal": psutil.BELOW_NORMAL_PRIORITY_CLASS,
         "Idle": psutil.IDLE_PRIORITY_CLASS}
 
+# Safety floors for saved or preset values. A hard 200 MB working-set cap, one core and a 5% CPU cap starve
+# Roblox until Windows spends all its time paging: that is what crashed clients and made windows freeze.
+MIN_CPU_CAP = 25         # percent of total CPU
+MIN_CORES = 2            # never pin a Roblox client to a single core
+MIN_RAM_CAP_MB = 1024    # a hard working-set cap below this causes paging storms
+MIN_GPU_CAP = 20         # percent GPU target; lower targets shrink windows to nothing
+MIN_GPU_SCALE = 0.35     # never shrink a preview below 35% of the window's base size
+MIN_AUTO_FLOOR = 10      # auto CPU mode's lowest ceiling
+
 PRESET_DEFS = {
     "balanced": dict(prio="Normal", size=None, automin=False, eco=False, cores=0, bgthrottle=False, trim=False,
                      memprio=False, gpu="default", gfx=0, fps=0, cpucap=0, interval=None),
-    "low": dict(prio="Below normal", size=(640, 360), automin=False, eco=False, cores=0, bgthrottle=True,
-                trim=True, memprio=True, gpu="power", gfx=3, fps=30, cpucap=50, interval=5),
-    "ultra": dict(prio="Below normal", size=(480, 270), automin=False, eco=True, cores=max(1, NCPU // 2),
-                  bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=20, cpucap=25, interval=5),
-    "minimal": dict(prio="Below normal", size=(320, 180), automin=False, eco=True, cores=1,
-                    bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=15, cpucap=10, interval=5),
-    "lowest": dict(prio="Below normal", size=(320, 180), automin=True, eco=True, cores=1,
-                   bgthrottle=True, trim=True, memprio=True, gpu="power", gfx=1, fps=45, cpucap=5, gpucap=5, ramcap=200, interval=5),
+    "low": dict(prio="Normal", size=(640, 360), automin=False, eco=False, cores=0, bgthrottle=True,
+                trim=False, memprio=False, gpu="power", gfx=3, fps=30, cpucap=50, interval=5),
+    "ultra": dict(prio="Normal", size=(480, 270), automin=False, eco=False, cores=min(NCPU, max(MIN_CORES, NCPU // 2)),
+                  bgthrottle=True, trim=False, memprio=False, gpu="power", gfx=1, fps=20, cpucap=25, interval=5),
+    "minimal": dict(prio="Normal", size=(320, 180), automin=False, eco=False, cores=min(NCPU, MIN_CORES),
+                    bgthrottle=True, trim=False, memprio=False, gpu="power", gfx=1, fps=15, cpucap=25,
+                    gpucap=0, ramcap=0, interval=5),
+    # Lowest resources that still run reliably: no hard RAM cap, no forced working-set trimming, no single-core
+    # pinning, and a CPU ceiling that grows the moment a client needs it. This replaces the old 200 MB / 1 core /
+    # 5% preset that crashed six of nine clients and made the survivors page constantly.
+    "lowest": dict(prio="Normal", size=(320, 180), automin=False, eco=False, cores=0,
+                   bgthrottle=True, trim=False, memprio=False, gpu="power", gfx=1, fps=30, cpucap=25,
+                   gpucap=0, ramcap=0, auto=True, capfloor=MIN_AUTO_FLOOR, interval=5),
     # Lowest resources that still run smoothly: the CPU ceiling follows each client's real need (never squeezing it),
     # windows shrink only when the GPU is busy, FPS is capped at 45, graphics at the floor, and nothing is forced
     # out of RAM (swapping is what makes games stutter).
     "smooth": dict(prio="Normal", size=(480, 270), automin=False, eco=False, cores=0, bgthrottle=False,
-                   trim=False, memprio=False, gpu="power", gfx=1, fps=45, cpucap=25, gpucap=12, gpumin=0.5,
-                   ramcap=0, auto=True, capfloor=8, interval=3),
+                   trim=False, memprio=False, gpu="power", gfx=1, fps=45, cpucap=25, gpucap=MIN_GPU_CAP,
+                   gpumin=0.5, ramcap=0, auto=True, capfloor=MIN_AUTO_FLOOR, interval=3),
 }
 
 
@@ -5022,8 +5039,8 @@ def os_set_ramcap(pid, mb):
     if not h:
         return False
     try:
-        if mb <= 0:  # HARDWS_MIN_DISABLE | HARDWS_MAX_DISABLE
-            return bool(kernel32.SetProcessWorkingSetSizeEx(h, 1 << 20, 64 << 30, 0x2 | 0x8))
+        if mb <= 0:  # HARDWS_MIN_DISABLE | HARDWS_MAX_DISABLE; a huge max means "no cap" without flushing the working set
+            return bool(kernel32.SetProcessWorkingSetSizeEx(h, 1 << 20, 1 << 40, 0x2 | 0x8))
         return bool(kernel32.SetProcessWorkingSetSizeEx(h, 1 << 20, int(mb) << 20, 0x2 | 0x4))  # MIN_DISABLE | MAX_ENABLE
     finally:
         kernel32.CloseHandle(h)
@@ -5096,6 +5113,80 @@ def set_self_cap(pct):
         return bool(kernel32.SetInformationJobObject(_SELF_JOB, 15, ctypes.byref(info), ctypes.sizeof(info)))
     except Exception:
         return False
+
+
+def release_self():
+    """Remove RoManager's own optional CPU ceiling and close its job handle. Idempotent."""
+    global _SELF_JOB
+    job = _SELF_JOB
+    _SELF_JOB = None
+    if not job:
+        return
+    try:
+        info = JOB_CPU_RATE(0, 0)
+        kernel32.SetInformationJobObject(job, 15, ctypes.byref(info), ctypes.sizeof(info))
+    except Exception:
+        pass
+    try:
+        kernel32.CloseHandle(job)
+    except Exception:
+        pass
+
+
+def release_client(c):
+    """Take back every limit RoManager put on one client. The Roblox process is never terminated here.
+    Safe for a client that already exited, safe to call twice, and it never raises."""
+    if not c:
+        return
+    pid = c.get("pid")
+    proc = c.get("proc")
+    alive = False
+    try:
+        alive = bool(proc is not None and proc.is_running())
+    except Exception:
+        alive = False
+    job = c.pop("job", None)
+    if job:
+        try:  # remove the hard CPU cap before closing the last handle (closing alone also destroys the job)
+            info = JOB_CPU_RATE(0, 0)
+            kernel32.SetInformationJobObject(job, 15, ctypes.byref(info), ctypes.sizeof(info))
+        except Exception:
+            pass
+        try:
+            kernel32.CloseHandle(job)
+        except Exception:
+            pass
+    if alive:
+        if c.get("ram_set"):
+            try:
+                os_set_ramcap(pid, 0)
+            except Exception:
+                pass
+        if c.get("eco_set"):
+            try:
+                os_set_eco(pid, False)
+            except Exception:
+                pass
+        if c.get("mem_set"):
+            try:
+                os_set_memprio(pid, 5)  # MEMORY_PRIORITY_NORMAL
+            except Exception:
+                pass
+        if c.get("aff_set"):
+            try:
+                proc.cpu_affinity(list(range(NCPU)))
+            except Exception:
+                pass
+        if c.get("tuned") is not None:
+            try:
+                proc.nice(psutil.NORMAL_PRIORITY_CLASS)
+            except Exception:
+                pass
+    c["cap_set"] = c["ram_set"] = c["eco_set"] = c["mem_set"] = c["aff_set"] = False
+    c["tuned"] = c["sized"] = None
+    c.pop("cap_now", None)
+    c.pop("calm", None)
+    c.pop("gscale", None)
 
 
 class PDH_VALUE(ctypes.Structure):
@@ -5327,6 +5418,7 @@ class Core:
         self.mutex = None
         self.ram_lifted, self.relax, self.ram_extra = False, 0, 0
         self.meter, self.disk_hot, self.disk_cool, self.disk_pct, self.pages_s = None, 0, 0, 0.0, 0.0
+        self.mem_pct, self.mem_avail = 0.0, 0
         self.holder = None
         self.multi_lock = threading.Lock()  # set_multi can be called from the start-up thread and the launch queue
         self.multi_status = "Multi-instance is off."
@@ -5357,11 +5449,69 @@ class Core:
         except Exception:
             pass
         psutil.cpu_percent(None)
+        # A previous session may have been killed before it could take its limits back. Those clients keep
+        # their old single-core affinity / hard RAM cap until something releases them, so do it at startup.
+        leftovers = roblox_pids()
+        if leftovers:
+            threading.Thread(target=self._release_leftovers, args=(leftovers,), daemon=True).start()
         threading.Thread(target=self.sample_loop, daemon=True).start()
         threading.Thread(target=self.gpu_loop, daemon=True).start()
         # multi-instance setup can take a moment and may scan handles; it must never delay the window
         if self.db.flag("multi"):
             threading.Thread(target=self._init_multi, daemon=True).start()
+
+    def _release_leftovers(self, pids):
+        """Remove stale limits from Roblox clients that were running before this RoManager session."""
+        n = 0
+        for pid in pids:
+            try:
+                p = psutil.Process(pid)
+                if "robloxplayerbeta" not in (p.name() or "").lower():
+                    continue
+                changed = False
+                try:
+                    if os_set_ramcap(pid, 0):
+                        changed = True
+                except Exception:
+                    pass
+                try:
+                    if os_set_eco(pid, False):
+                        changed = True
+                except Exception:
+                    pass
+                try:
+                    if os_set_memprio(pid, 5):
+                        changed = True
+                except Exception:
+                    pass
+                try:
+                    if set(p.cpu_affinity()) != set(range(NCPU)):
+                        p.cpu_affinity(list(range(NCPU)))
+                        changed = True
+                except (psutil.Error, OSError, ValueError):
+                    pass
+                try:
+                    if p.nice() != psutil.NORMAL_PRIORITY_CLASS:
+                        p.nice(psutil.NORMAL_PRIORITY_CLASS)
+                        changed = True
+                except psutil.Error:
+                    pass
+                if changed:
+                    n += 1
+            except (psutil.Error, OSError):
+                pass
+        if n:
+            self.log(f"Released leftover CPU/RAM limits on {n} Roblox client(s) from an earlier session.", "ok")
+        # A crashed earlier session could also leave the old GPU-target windows shrunken to a few pixels.
+        try:
+            for pid, hwnd in find_windows(set(pids)).items():
+                if user32.IsIconic(hwnd):
+                    continue
+                x, y, w, h = win_rect(hwnd)
+                if w < 120 or h < 70:
+                    win_place(hwnd, x, y, 640, 360)
+        except Exception:
+            pass
 
     def _init_multi(self):
         try:
@@ -5798,6 +5948,22 @@ class Core:
         d.setdefault("gpumin", 0.03)
         d.setdefault("auto", False)
         d.setdefault("capfloor", 5)
+        # Safety floors: old aggressive settings (200 MB RAM, one core, 5% CPU) must never starve a client again.
+        if d["cores"] > 0:
+            d["cores"] = min(NCPU, max(MIN_CORES, int(d["cores"])))
+        if d["cpucap"] > 0:
+            d["cpucap"] = max(MIN_CPU_CAP, min(100, int(d["cpucap"])))
+        if d["ramcap"] > 0:
+            d["ramcap"] = max(MIN_RAM_CAP_MB, int(d["ramcap"]))
+        if d["gpucap"] > 0:
+            d["gpucap"] = max(MIN_GPU_CAP, min(100, int(d["gpucap"])))
+        d["gpumin"] = max(MIN_GPU_SCALE, min(1.0, float(d["gpumin"])))
+        if d["prio"] not in PRIO:
+            d["prio"] = "Normal"
+        elif d["prio"] == "Idle":
+            d["prio"] = "Below normal"  # Idle starves the input thread; below normal is the floor
+        if d["auto"]:
+            d["capfloor"] = max(MIN_AUTO_FLOOR, int(d["capfloor"]))
         if d["ramcap"] and self.ram_extra:
             d["ramcap"] += self.ram_extra
         if self.ram_lifted:
@@ -5841,19 +6007,36 @@ class Core:
         c["cap_now"] = round(new, 1) if abs(new - cap) >= 2 else round(cap, 1)
 
     def tune(self, c, pr, fg, idx):
-        bg = bool(c["hwnd"]) and c["hwnd"] != fg and not c.get("embedded")  # the client you are playing is never throttled
+        # The client you are playing (or one that is still starting) is never throttled. A client embedded in a
+        # Multi-View tile only counts as foreground while the pointer is over that tile; the rest keep running,
+        # but in the background, so nine clients stay responsive together.
+        if c.get("embedded"):
+            front = True
+        elif c.get("mv_embed"):
+            front = bool(c.get("mv_focus"))
+        else:
+            front = not c.get("hwnd") or c["hwnd"] == fg
+        bg = bool(c["hwnd"]) and not front
         prio = pr["prio_class"]
-        if bg and pr["bgthrottle"] and prio == psutil.NORMAL_PRIORITY_CLASS:
-            prio = psutil.BELOW_NORMAL_PRIORITY_CLASS
+        if pr["bgthrottle"]:
+            if front:
+                prio = psutil.NORMAL_PRIORITY_CLASS
+            elif bg and prio == psutil.NORMAL_PRIORITY_CLASS:
+                prio = psutil.BELOW_NORMAL_PRIORITY_CLASS
         eco = bool(pr["eco"] or (bg and pr["bgthrottle"]))
+        mem = bool(pr["memprio"] and (bg or not pr["bgthrottle"]))
         now = time.time()
-        do_trim = bg and pr["trim"] and not pr["ramcap"] and now - c["last_trim"] > 60
+        # Emptying a Roblox working set on a timer makes it page everything back in, so only do it when the
+        # system is genuinely short of memory, at most every five minutes.
+        do_trim = False
+        if bg and pr["trim"] and not pr["ramcap"] and now - c["last_trim"] > 300:
+            do_trim = self.mem_pct >= 80 or (self.mem_avail and self.mem_avail < int(1.5 * 2 ** 30))
         if pr["auto"]:
             self.auto_cap(c, pr)
             cap = int(c.get("cap_now") or pr["cpucap"])
         else:
             cap = pr["cpucap"]
-        state = (prio, eco, bool(pr["memprio"]), pr["cores"], pr["size"], bool(c["hwnd"]), cap, pr["ramcap"])
+        state = (prio, eco, mem, pr["cores"], pr["size"], bool(c["hwnd"]), cap, pr["ramcap"], bool(front))
         if c["tuned"] == state and not do_trim:
             return
         pid = c["pid"]
@@ -5867,10 +6050,10 @@ class Core:
                     c["eco_set"] = eco
                 elif eco:
                     self._deny(c, "efficiency mode")
-            if pr["memprio"] or c.get("mem_set"):
-                if os_set_memprio(pid, 2 if pr["memprio"] else 5):
-                    c["mem_set"] = pr["memprio"]
-                elif pr["memprio"]:
+            if mem or c.get("mem_set"):
+                if os_set_memprio(pid, 2 if mem else 5):
+                    c["mem_set"] = mem
+                elif mem:
                     self._deny(c, "low memory priority")
             if pr["ramcap"] or c.get("ram_set"):
                 if os_set_ramcap(pid, pr["ramcap"]):
@@ -5890,7 +6073,8 @@ class Core:
                     c["aff_set"] = pr["cores"] > 0
                 except (psutil.Error, OSError, ValueError):
                     self._deny(c, "CPU core limit")
-            if pr["size"] and c["hwnd"] and not (c.get("embedded") or c.get("mv")) and c["sized"] != pr["size"]:
+            if pr["size"] and c["hwnd"] and not (c.get("embedded") or c.get("mv") or c.get("mv_embed")) \
+                    and c["sized"] != pr["size"]:
                 x, y, _, _ = win_rect(c["hwnd"])
                 win_place(c["hwnd"], x, y, *pr["size"])
                 c["sized"] = pr["size"]
@@ -5914,7 +6098,8 @@ class Core:
                 self.log(f"Tuning error for PID {c['pid']}: {e}")
         if pr["automin"]:
             for c in cl:
-                if c["hwnd"] and not (c.get("embedded") or c.get("mv")) and c["hwnd"] != fg and not user32.IsIconic(c["hwnd"]):
+                if c["hwnd"] and not (c.get("embedded") or c.get("mv") or c.get("mv_embed")) \
+                        and c["hwnd"] != fg and not user32.IsIconic(c["hwnd"]):
                     win_show(c["hwnd"], 6)
 
     def apply_when_ready(self, pid):
@@ -5937,6 +6122,9 @@ class Core:
         for c in self.snapshot():
             c["tuned"] = None
             c["sized"] = None
+            c["calm"] = 0
+            c.pop("cap_now", None)
+            c.pop("gscale", None)
         threading.Thread(target=self.apply_global_perf, daemon=True).start()
         self.tune_all()
 
@@ -6055,8 +6243,8 @@ class Core:
         changed = False
         for c in cl:
             h = c["hwnd"]
-            if not h or user32.IsIconic(h):
-                continue
+            if not h or user32.IsIconic(h) or c.get("embedded") or c.get("mv") or c.get("mv_embed"):
+                continue  # embedded/preview windows are sized by the app, not by the GPU target
             g = usage.get(c["pid"], 0.0)
             c["gpu"] = g
             base = tuple(pr["size"]) if pr["size"] else c.setdefault("gbase", tuple(win_rect(h)[2:]))
@@ -6069,7 +6257,7 @@ class Core:
                 continue
             c["gscale"] = sc
             changed = True
-            x, y = (0, 0) if c.get("embedded") else win_rect(h)[:2]
+            x, y = win_rect(h)[:2]
             win_place(h, x, y, max(32, int(base[0] * sc)), max(18, int(base[1] * sc)))
         return changed
 
@@ -6093,6 +6281,7 @@ class Core:
         if self.stop:
             return
         vm = psutil.virtual_memory()
+        self.mem_pct, self.mem_avail = vm.percent, vm.available
         net = psutil.net_io_counters()
         now = time.time()
         up = down = 0.0
@@ -6168,7 +6357,7 @@ class Core:
                 self.close_client(c["pid"], expected=False)
 
     def limited(self, c):
-        return bool(c.get("cap_set") or c.get("ram_set") or c.get("aff_set") or c.get("eco_set"))
+        return bool(c.get("cap_set") or c.get("ram_set") or c.get("aff_set") or c.get("eco_set") or c.get("mem_set"))
 
     def _relax(self, why):
         if not self.db.flag("relax_on") or self.relax >= 3:
@@ -6180,6 +6369,7 @@ class Core:
     def on_exit(self, pid):
         with self.lock:
             c = self.clients.pop(pid, None)
+        was_limited = bool(c and self.limited_was(c))  # capture before release_client clears the state
         if c:
             release_client(c)  # closes the per-client job handle (no handle leak per client)
         if not self.stop:
@@ -6194,7 +6384,7 @@ class Core:
             return
         self.failed += 1
         self.log(f"{c['name']}: client exited unexpectedly (PID {pid})", "bad")
-        if time.time() - c["start"] < 900 and self.limited_was(c):
+        if time.time() - c["start"] < 900 and was_limited:
             self._relax(f"{c['name']} crashed under the limits.")
         self.notify("crash", f"{c['name']}: Roblox client (PID {pid}) exited unexpectedly.")
         if not self.db.flag("auto"):
@@ -6206,9 +6396,9 @@ class Core:
         threading.Thread(target=self._recover, args=(aid, c["name"], c["dest"], n), daemon=True).start()
 
     def limited_was(self, c):
-        """Whether the client was running under limits when it ended (release_client already cleared the flags)."""
+        """Whether the client was running under limits when it ended. Call before release_client."""
         st = c.get("tuned")
-        return bool(st and (st[1] or st[3] or st[6] or st[7]))
+        return bool(st and (st[1] or st[2] or st[3] or st[6] or st[7]))
 
     def _recover(self, aid, name, dest, n):
         mx = self.db.num("max_attempts", 1, 20)
@@ -6305,6 +6495,13 @@ user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetWindowLongPtrW.argtypes = [V, ctypes.c_int]
 user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.SetWindowLongPtrW.argtypes = [V, ctypes.c_int, ctypes.c_ssize_t]
+user32.GetWindowThreadProcessId.argtypes = [V, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [V]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 GWL_STYLE, WS_CHILD, WS_POPUP, WS_VISIBLE = -16, 0x40000000, 0x80000000, 0x10000000
 WS_STRIP = 0x00C00000 | 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000  # caption, frame, sysmenu, min, max
 
@@ -6332,6 +6529,43 @@ def release_window(hwnd, saved):
     user32.SetParent(hwnd, V(0))
     user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style & 0xFFFFFFFF)
     user32.SetWindowPos(hwnd, V(0), int(x), int(y), int(w), int(h), 0x0004 | 0x0020 | 0x0040)
+
+
+def focus_embedded(hwnd, top=0):
+    """Attach this thread's input queue to the client's thread and focus the re-parented window. SetFocus alone
+    never works across processes, which is why an embedded Roblox window would otherwise ignore the keyboard.
+    The caller keeps the attachment until it switches tiles and then calls release_embedded_focus()."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return 0
+    cur = int(kernel32.GetCurrentThreadId())
+    target = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+    if not target:
+        return 0
+    try:
+        if target != cur and not user32.AttachThreadInput(cur, target, True):
+            return 0
+        if top and (user32.GetForegroundWindow() or 0) != top:
+            user32.SetForegroundWindow(top)
+        user32.SetFocus(hwnd)
+        return target
+    except Exception:
+        if target != cur:
+            try:
+                user32.AttachThreadInput(cur, target, False)
+            except Exception:
+                pass
+        return 0
+
+
+def release_embedded_focus(tid):
+    if not tid:
+        return
+    cur = int(kernel32.GetCurrentThreadId())
+    if tid != cur:
+        try:
+            user32.AttachThreadInput(cur, tid, False)
+        except Exception:
+            pass
 
 
 class POINT(ctypes.Structure):
@@ -6595,6 +6829,7 @@ def slider_row(parent, text, frm, to, steps, value, fmt, save=None):
     s.set(value)
     s.pack(fill="x", pady=(3, 0))
     s.configure(command=lambda v: (val.configure(text=fmt(v)), save and save(v)))
+    s._value_label, s._fmt = val, fmt  # lets callers show a clamped value after a save
     return s
 
 
@@ -8461,14 +8696,26 @@ class MultiViewPage(Page):
     """Grid of live previews drawn by Windows' own compositor (DWM): the whole window, scaled, GPU-composed,
     no screen grabbing and no polling. Click one to open it on the stage, where you can play it normally."""
     GAP, CAP = 12, 34
+    TILE_CAPS = {"auto": None, "s": (240, 135), "m": (320, 180), "l": (480, 270), "xl": (640, 360)}
+    TILE_LABELS = {"auto": "Auto", "s": "S", "m": "M", "l": "L", "xl": "XL"}
+    COL_LABELS = ["Auto", "1", "2", "3", "4", "5", "6"]
 
     def __init__(self, parent, app):
-        super().__init__(parent, app, "Multi-View", "Live previews of every client. Click one to play it.")
-        self.tiles, self.thumbs, self.orig = {}, {}, {}
+        super().__init__(parent, app, "Multi-View", "Live previews of every client. Play them in the tiles or on the stage.")
+        self.cfg = self.load_cfg()
+        self.tiles, self.thumbs, self.orig, self.tile_saved = {}, {}, {}, {}
         self.stage_pid = self.stage_saved = None
         self.active, self._job, self._order = False, None, None
-        self.back = btn(self.actions, "▦  Back to grid", self.unstage, "ghost", w=140, h=36)
-        btn(self.actions, "Show all on desktop", self.release_btn, "ghost", w=170, h=36).pack(side="left", padx=4)
+        self.focus_pid, self.embed_failed = None, set()
+        self._focus_hold = 0.0
+        self._kb_hwnd, self._stage_key = 0, False
+        self._kb_tid = 0
+        self.back = btn(self.actions, "▦  Grid", self.unstage, "ghost", w=104, h=36)
+        self.live_btn = btn(self.actions, "▶  Run in tiles", self.toggle_live, "ghost", w=136, h=36)
+        self.live_btn.pack(side="left", padx=4)
+        btn(self.actions, "Show desktop", self.release_btn, "ghost", w=140, h=36).pack(side="left", padx=4)
+        btn(self.actions, "⚙  Layout", self.layout_settings, "ghost", w=104, h=36).pack(side="left", padx=4)
+        self.update_live_btn()
         self.area = ctk.CTkFrame(self, fg_color="transparent")
         self.area.pack(fill="both", expand=True)
         self.area.bind("<Configure>", lambda e: self.schedule())
@@ -8479,6 +8726,7 @@ class MultiViewPage(Page):
         L(self.empty, "Launch an account and its live window appears here.", 11, muted=True).pack(padx=36, pady=(2, 26))
         self.empty.place(relx=0.5, rely=0.45, anchor="center")
         self.after(500, self.follow)
+        self.after(700, self.track_focus)
         self.after(1000, self.pulse)
 
     def root(self):
@@ -8487,10 +8735,147 @@ class MultiViewPage(Page):
     def client(self, pid):
         return next((c for c in self.core.snapshot() if c["pid"] == pid), None)
 
+    # ---- layout preferences (persisted like the rest of the app)
+    def load_cfg(self):
+        db = self.core.db
+        cols = db.get("mv_cols")
+        if cols not in ("auto", "1", "2", "3", "4", "5", "6"):
+            cols = "auto"
+        tile = db.get("mv_tile")
+        if tile not in self.TILE_CAPS:
+            tile = "auto"
+        return {"cols": cols, "tile": tile, "fill": db.flag("mv_fill"),
+                "gap": db.num("mv_gap", 0, 24), "caps": db.flag("mv_caps"),
+                "split": db.num("mv_split", 50, 90), "live": db.flag("mv_live")}
+
+    def save_cfg(self, **kw):
+        for k, v in kw.items():
+            self.cfg[k] = v
+            self.core.db.set("mv_" + k, ("1" if v else "0") if isinstance(v, bool) else str(v))
+        if "tile" in kw:
+            cap = self.TILE_CAPS.get(self.cfg["tile"])
+            if cap:
+                self.core.db.set("mv_w", cap[0])
+                self.core.db.set("mv_h", cap[1])
+        self.schedule()
+
+    def reset_cfg(self):
+        was_live = bool(self.cfg.get("live"))
+        self.cfg = {"cols": "auto", "tile": "auto", "fill": False, "gap": 12, "caps": True, "split": 76,
+                    "live": False}
+        for k, v in self.cfg.items():
+            self.core.db.set("mv_" + k, ("1" if v else "0") if isinstance(v, bool) else str(v))
+        self.core.db.set("mv_w", 320)
+        self.core.db.set("mv_h", 180)
+        self.update_live_btn()
+        if was_live and self.active:
+            self.unembed_all(repark=True)
+            self.refresh()
+        self.schedule()
+
+    def update_live_btn(self):
+        try:
+            self.live_btn.configure(text="▦  Previews" if self.cfg.get("live") else "▶  Run in tiles")
+        except Exception:
+            pass
+
+    def toggle_live(self):
+        self.set_live(not self.cfg.get("live"))
+
+    def set_live(self, on):
+        on = bool(on)
+        if on == bool(self.cfg.get("live")):
+            self.update_live_btn()
+            return
+        self.cfg["live"] = on
+        self.core.db.set("mv_live", "1" if on else "0")
+        self.update_live_btn()
+        if on:
+            if self.active:
+                self.embed_all()
+            self.app.toast("Roblox now runs inside the tiles. Hover a tile to give it full speed.", "ok")
+        else:
+            if self.active:
+                self.unembed_all(repark=True)
+                self.refresh()
+            self.app.toast("Tiles are previews again. Click one to play it on the stage.", "info")
+        self.schedule()
+
+    def layout_settings(self):
+        top = dialog(self.app, "Multi-View layout", 560, 620)
+        box = card(top, fg_color=T["panel"], corner_radius=R + 2)
+        box.pack(fill="both", expand=True, padx=1, pady=1)
+        L(box, "Multi-View layout", 18, True).pack(anchor="w", padx=18, pady=(14, 0))
+        L(box, "Changes apply instantly and are saved for the next launch.", 11, muted=True).pack(anchor="w", padx=18, pady=(2, 8))
+        body = ctk.CTkScrollableFrame(box, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=10)
+
+        L(body, "G R I D", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(4, 4))
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=4)
+        L(row, "Columns", 12).pack(side="left")
+        seg_cols = SEG(row, self.COL_LABELS, width=300)
+        seg_cols.set("Auto" if self.cfg["cols"] == "auto" else self.cfg["cols"])
+        seg_cols.configure(command=lambda v: self.save_cfg(cols="auto" if v == "Auto" else v))
+        seg_cols.pack(side="right")
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=4)
+        L(row, "Maximum tile size", 12).pack(side="left")
+        seg_tile = SEG(row, list(self.TILE_LABELS.values()), width=250)
+        seg_tile.set(self.TILE_LABELS[self.cfg["tile"]])
+        seg_tile.configure(command=lambda v: self.save_cfg(
+            tile=next((k for k, n in self.TILE_LABELS.items() if n == v), "auto")))
+        seg_tile.pack(side="right")
+        slider_row(body, "Gap between previews", 0, 24, 24, self.cfg["gap"],
+                   lambda v: f"{int(v)} px", save=lambda v: self.save_cfg(gap=int(v)))
+        sw = SW(body, "Show captions and tile controls")
+        if self.cfg["caps"]:
+            sw.select()
+        sw.configure(command=lambda: self.save_cfg(caps=bool(sw.get())))
+        sw.pack(anchor="w", padx=8, pady=6)
+
+        L(body, "I N T E R A C T I V E", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(12, 4))
+        sw_live = SW(body, "Run Roblox inside the tiles")
+        if self.cfg.get("live"):
+            sw_live.select()
+        sw_live.configure(command=lambda: self.set_live(bool(sw_live.get())))
+        sw_live.pack(anchor="w", padx=8, pady=6)
+        L(body, "Each tile hosts its real client, so you can click and play without a separate window. Only the "
+                "tile under the pointer gets full CPU; the others keep running in the background at reduced "
+                "priority. Leaving the tab gives the windows back to your desktop. Previews are cheaper.",
+          10, muted=True, wraplength=470, justify="left").pack(anchor="w", padx=8, pady=(2, 6))
+
+        L(body, "P R E V I E W", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(12, 4))
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=4)
+        L(row, "Aspect", 12).pack(side="left")
+        seg_fit = SEG(row, ["Fit", "Fill"], width=180)
+        seg_fit.set("Fill" if self.cfg["fill"] else "Fit")
+        seg_fit.configure(command=lambda v: self.save_cfg(fill=(v == "Fill")))
+        seg_fit.pack(side="right")
+        L(body, "Fit shows the whole window with letterboxing. Fill crops the edges so the preview "
+                "covers the whole tile without stretching.", 10, muted=True, wraplength=470,
+          justify="left").pack(anchor="w", padx=8, pady=(2, 6))
+
+        L(body, "S T A G E", 9, True, color=T["lav"]).pack(anchor="w", padx=8, pady=(12, 4))
+        slider_row(body, "Stage width when playing", 50, 90, 40, self.cfg["split"],
+                   lambda v: f"{int(v)}%", save=lambda v: self.save_cfg(split=int(v)))
+        L(body, "Click a preview to play it on the stage. With interactive tiles on, click it to use it in place; "
+                "right-click for play, desktop and close.", 10, muted=True, wraplength=470, justify="left"
+          ).pack(anchor="w", padx=8, pady=(4, 8))
+
+        bar = ctk.CTkFrame(box, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(4, 12))
+        btn(bar, "Reset defaults",
+            lambda: (self.reset_cfg(), top.destroy(), self.app.toast("Multi-View layout reset", "ok")),
+            "ghost", w=132, h=36).pack(side="left")
+        btn(bar, "Done", top.destroy, "accent", w=104, h=36).pack(side="right")
+        top.protocol("WM_DELETE_WINDOW", top.destroy)
+
     # ---- real windows: parked off-screen while previewed, put back afterwards
     def park(self, c):
         h = c["hwnd"]
-        if not h or c.get("embedded") or c.get("mv"):
+        if not h or c.get("embedded") or c.get("mv") or c.get("mv_embed"):
             return
         if c["pid"] not in self.orig:
             user32.ShowWindow(h, 9)
@@ -8506,6 +8891,187 @@ class MultiViewPage(Page):
         if r and c["hwnd"] and user32.IsWindow(c["hwnd"]):
             x, y, w, hh = r
             win_place(c["hwnd"], x if x > -10000 else 100, y if y > -10000 else 100, w, hh)
+
+    # ---- interactive tiles: the real client is re-parented into its preview frame
+    def live_on(self):
+        return bool(self.active and self.cfg.get("live"))
+
+    def embed_tile(self, pid):
+        if not self.live_on():
+            return False
+        c, t = self.client(pid), self.tiles.get(pid)
+        if not (c and t and c["hwnd"] and user32.IsWindow(c["hwnd"])):
+            return False
+        if pid == self.stage_pid or t.get("detached") or c.get("embedded"):
+            return False
+        if c.get("mv_embed"):
+            return True
+        if pid in self.embed_failed or not t["view"].winfo_ismapped():
+            return False
+        w = max(2, t["view"].winfo_width())
+        hh = max(2, t["view"].winfo_height())
+        if w < 24 or hh < 16:  # the grid has not settled yet; sync will retry after layout
+            return False
+        hwnd = c["hwnd"]
+        self.drop_thumb(pid)
+        try:
+            user32.ShowWindow(hwnd, 9)
+            if pid not in self.orig:  # remember the desktop rectangle before moving it into the app
+                self.orig[pid] = win_rect(hwnd)
+            c["mv"] = True
+            saved = embed_window(hwnd, t["view"].winfo_id(), w, hh)
+        except Exception as e:
+            self.embed_failed.add(pid)
+            c["mv"], c["mv_embed"], c["tuned"] = False, False, None
+            self.unpark(c)  # put the window back exactly where it was; the tile falls back to a preview
+            self.core.log(f"{c['name']}: could not run in the tile ({e}); preview stays available.", "warn")
+            return False
+        self.tile_saved[pid] = saved
+        c["mv_embed"] = True
+        c["mv_focus"] = pid == self.focus_pid
+        c["tuned"] = None
+        t["lab"].place_forget()
+        t["pill"].configure(text=" Playing ", text_color=OK, fg_color=blend(OK, T["panel"], .16))
+        return True
+
+    def embed_all(self):
+        if not self.live_on():
+            return
+        for pid in list(self.tiles):
+            self.embed_tile(pid)
+        if self.focus_pid not in self.tiles:
+            self.focus_pid = None
+        self.apply_focus()
+
+    def unembed_tile(self, pid, repark=True):
+        saved = self.tile_saved.pop(pid, None)
+        c = self.client(pid)
+        hwnd = c["hwnd"] if c else None
+        if saved and hwnd and user32.IsWindow(hwnd):
+            release_window(hwnd, saved)
+        if c:
+            c["mv_embed"] = False
+            c["mv_focus"] = False
+            c["tuned"] = None
+            if self._kb_hwnd == hwnd:
+                self.release_keyboard()
+            if repark:
+                self.unpark(c)
+        t = self.tiles.get(pid)
+        if t:
+            try:
+                t["lab"].place(relx=0.5, rely=0.5, anchor="center")
+            except Exception:
+                pass
+        return bool(saved)
+
+    def unembed_all(self, repark=True):
+        for pid in list(self.tile_saved):
+            self.unembed_tile(pid, repark=repark)
+        for c in self.core.snapshot():
+            if c.get("mv_embed"):
+                c["mv_embed"] = False
+                c["mv_focus"] = False
+                c["tuned"] = None
+        self.focus_pid = None
+        self.release_keyboard()
+
+    def apply_focus(self):
+        """Give the tile under the pointer Normal priority and keep every other live tile in the background."""
+        changed = False
+        for c in self.core.snapshot():
+            if not c.get("mv_embed"):
+                continue
+            want = c["pid"] == self.focus_pid
+            if bool(c.get("mv_focus")) != want:
+                c["mv_focus"] = want
+                c["tuned"] = None
+                changed = True
+        if changed:
+            self.app.bg(self.core.tune_all)
+
+    def grab_keyboard(self, hwnd):
+        """Hand the keyboard to the Roblox client in this tile (cross-process input queues attached)."""
+        if not hwnd or hwnd == self._kb_hwnd:
+            return
+        self.release_keyboard()
+        tid = focus_embedded(hwnd, self.root())
+        if tid:
+            self._kb_hwnd, self._kb_tid = hwnd, tid
+
+    def release_keyboard(self):
+        release_embedded_focus(self._kb_tid)
+        self._kb_hwnd, self._kb_tid = 0, 0
+
+    def focus_tile(self, pid):
+        if not self.cfg.get("live"):
+            self.play(pid)
+            return
+        t = self.tiles.get(pid)
+        if t:
+            t["detached"] = False
+        self.embed_failed.discard(pid)
+        self.focus_pid = pid
+        self._focus_hold = time.time() + 1.5
+        self.embed_tile(pid)
+        c = self.client(pid)
+        if c and c.get("mv_embed"):
+            self.grab_keyboard(c["hwnd"])
+        self.apply_focus()
+
+    def track_focus(self):
+        try:
+            if self.live_on():
+                hot, hot_hwnd = None, 0
+                root = self.root()
+                fg = user32.GetForegroundWindow() or 0
+                if root and (fg == root or user32.IsChild(root, fg)):
+                    pt = POINT()
+                    if user32.GetCursorPos(ctypes.byref(pt)):
+                        cl = {c["pid"]: c for c in self.core.snapshot()}
+                        for pid, t in self.tiles.items():
+                            c = cl.get(pid)
+                            if not (c and c.get("mv_embed")):
+                                continue
+                            f = t["frame"]
+                            x, y = f.winfo_rootx(), f.winfo_rooty()
+                            if x <= pt.x < x + max(1, f.winfo_width()) and \
+                                    y <= pt.y < y + max(1, f.winfo_height()):
+                                hot, hot_hwnd = pid, c["hwnd"]
+                                break
+                if hot is not None:
+                    if hot != self.focus_pid:
+                        self.focus_pid = hot
+                        self.apply_focus()
+                        if hot_hwnd:
+                            self.grab_keyboard(hot_hwnd)
+                elif time.time() >= self._focus_hold and self.focus_pid is not None:
+                    self.focus_pid = None
+                    self.apply_focus()
+                    self.release_keyboard()
+        except Exception:
+            pass
+        self.after(150, self.track_focus)
+
+    def tile_click(self, pid):
+        # In live mode a click means "use this tile in place"; the embedded client receives the real click.
+        if self.cfg.get("live") and self.active and self.stage_pid is None:
+            self.focus_tile(pid)
+        else:
+            self.play(pid)
+
+    def run_in_tile(self, pid):
+        if self.stage_pid == pid:
+            self.unstage(redraw=False)
+        t = self.tiles.get(pid)
+        if t:
+            t["detached"] = False
+        self.embed_failed.discard(pid)
+        if not self.cfg.get("live"):
+            self.set_live(True)
+        self.focus_tile(pid)
+        self._focus_hold = time.time() + 1.5
+        self.after(160, lambda p=pid: self.embed_tile(p))
 
     # ---- DWM thumbnails
     def thumb_for(self, c):
@@ -8526,13 +9092,28 @@ class MultiViewPage(Page):
     def sync(self):
         if not self.active:
             return
+        fill = bool(self.cfg.get("fill"))
         origin = POINT(0, 0)
         user32.ClientToScreen(self.root(), ctypes.byref(origin))
         for pid, t in list(self.tiles.items()):
             c = self.client(pid)
-            if not (c and c["hwnd"] and pid != self.stage_pid and t["frame"].winfo_ismapped() and user32.IsWindow(c["hwnd"])):
+            if not (c and c["hwnd"] and pid != self.stage_pid and t["frame"].winfo_ismapped()
+                    and user32.IsWindow(c["hwnd"])):
                 self.drop_thumb(pid)
+                if c and c.get("mv_embed"):
+                    self.unembed_tile(pid, repark=False)
                 continue
+            if c.get("mv_embed"):
+                self.drop_thumb(pid)
+                t["lab"].place_forget()
+                continue
+            if self.live_on() and not c.get("embedded") and not t.get("detached"):
+                if self.embed_tile(pid):
+                    self.drop_thumb(pid)
+                    continue
+            if t.get("fill") != fill:  # switching aspect modes is cleanest with a fresh thumbnail registration
+                self.drop_thumb(pid)
+                t["fill"] = fill
             th = self.thumb_for(c)
             if not th:
                 t["lab"].configure(text="Preview unavailable")
@@ -8544,14 +9125,26 @@ class MultiViewPage(Page):
             v = t["view"]
             vx, vy = v.winfo_rootx() - origin.x, v.winfo_rooty() - origin.y
             vw, vh = max(1, v.winfo_width()), max(1, v.winfo_height())
-            sc = min(vw / sz.cx, vh / sz.cy)  # fit the WHOLE window inside the tile, keep its shape
-            dw, dh = max(1, int(sz.cx * sc)), max(1, int(sz.cy * sc))
-            x0, y0 = vx + (vw - dw) // 2, vy + (vh - dh) // 2
             pr = DWM_THUMBNAIL_PROPERTIES()
-            pr.dwFlags = 0x1 | 0x8 | 0x10  # destination | visible | client area only
-            pr.rcDestination = wintypes.RECT(x0, y0, x0 + dw, y0 + dh)
             pr.fVisible = True
             pr.fSourceClientAreaOnly = True
+            if fill:  # cover: crop the source to the tile's aspect, then fill the whole view
+                target = vw / vh
+                if sz.cx / sz.cy > target:
+                    cw, ch = max(1, int(sz.cy * target)), sz.cy
+                    sx, sy = (sz.cx - cw) // 2, 0
+                else:
+                    cw, ch = sz.cx, max(1, int(sz.cx / target))
+                    sx, sy = 0, (sz.cy - ch) // 2
+                pr.dwFlags = 0x1 | 0x2 | 0x8 | 0x10  # destination | source | visible | client area only
+                pr.rcSource = wintypes.RECT(sx, sy, sx + cw, sy + ch)
+                pr.rcDestination = wintypes.RECT(vx, vy, vx + vw, vy + vh)
+            else:  # fit: keep the whole window visible, letterboxed inside the tile
+                sc = min(vw / sz.cx, vh / sz.cy)
+                dw, dh = max(1, int(sz.cx * sc)), max(1, int(sz.cy * sc))
+                x0, y0 = vx + (vw - dw) // 2, vy + (vh - dh) // 2
+                pr.dwFlags = 0x1 | 0x8 | 0x10  # destination | visible | client area only
+                pr.rcDestination = wintypes.RECT(x0, y0, x0 + dw, y0 + dh)
             if dwmapi.DwmUpdateThumbnailProperties(th, ctypes.byref(pr)) != 0:
                 self.drop_thumb(pid)
             else:
@@ -8568,43 +9161,72 @@ class MultiViewPage(Page):
         W, H = self.area.winfo_width(), self.area.winfo_height()
         if W < 60 or H < 60:
             return
-        G, CAP = self.GAP, self.CAP
+        G = max(0, int(self.cfg.get("gap", self.GAP)))
+        CAP = self.CAP if self.cfg.get("caps", True) else 0
         order = [p for p in (self._order or []) if p in self.tiles]
         stage = self.stage_pid if self.stage_pid in self.tiles else None
         rects = {}
         if stage:
             others = [p for p in order if p != stage]
-            sw = W if not others else int(W * 0.76)
+            sw = W if not others else int(W * self.cfg.get("split", 76) / 100)
+            if others:
+                sw = max(300, min(sw, W - 200))
             self.stage.place(x=0, y=0, width=sw, height=H)
             c = self.client(stage)
             if c and c.get("embedded") and c["hwnd"]:
                 win_place(c["hwnd"], 0, 0, sw, H)
             if others:
-                x0, w = sw + G, W - sw - G
-                h = int(w * 9 / 16)
-                avail = H - G * (len(others) - 1)
-                if len(others) * (h + CAP) > avail:
-                    h = max(24, avail // len(others) - CAP)
-                    w = int(h * 16 / 9)
+                x0 = sw + G
+                w = max(80, W - sw - G)
+                side_cols = 2 if len(others) >= 4 and w >= 190 else 1
+                rows = math.ceil(len(others) / side_cols)
+                cw = (w - G * (side_cols - 1)) / side_cols
+                ch = cw * 9 / 16
+                avail = H - G * (rows - 1)
+                if rows * (ch + CAP) > avail:
+                    ch = max(20, avail / rows - CAP)
+                    cw = ch * 16 / 9
+                cap = self.TILE_CAPS.get(self.cfg.get("tile", "auto"))
+                if cap:
+                    cw, ch = min(cw, cap[0]), min(ch, cap[1])
+                cw, ch = max(40, int(cw)), max(20, int(ch))
+                ty = max(0, (H - (rows * (ch + CAP) + G * (rows - 1))) // 2)
                 for i, p in enumerate(others):
-                    rects[p] = (x0, i * (h + CAP + G), w, h)
+                    r, k = divmod(i, side_cols)
+                    rects[p] = (x0 + k * (cw + G), ty + r * (ch + CAP + G), cw, ch)
         elif order:
             self.stage.place_forget()
-            n, best = len(order), None
-            for cols in range(1, n + 1):
+            n = len(order)
+            cols_opt = self.cfg.get("cols", "auto")
+            if cols_opt == "auto":
+                rows, best = 1, None
+                for cols in range(1, n + 1):
+                    rows = math.ceil(n / cols)
+                    w = (W - G * (cols - 1)) / cols
+                    h = w * 9 / 16
+                    if rows * (h + CAP) + G * (rows - 1) > H:
+                        h = (H - G * (rows - 1)) / rows - CAP
+                        w = h * 16 / 9
+                    if best is None or w > best[0]:
+                        best = (w, h, cols, rows)
+                w, h, cols, rows = best
+            else:
+                cols = max(1, int(cols_opt))
                 rows = math.ceil(n / cols)
                 w = (W - G * (cols - 1)) / cols
                 h = w * 9 / 16
                 if rows * (h + CAP) + G * (rows - 1) > H:
                     h = (H - G * (rows - 1)) / rows - CAP
                     w = h * 16 / 9
-                if best is None or w > best[0]:
-                    best = (w, h, cols)
-            w, h, cols = max(40, int(best[0])), max(24, int(best[1])), best[2]
+            cap = self.TILE_CAPS.get(self.cfg.get("tile", "auto"))
+            if cap:
+                w, h = min(w, cap[0]), min(h, cap[1])
+            w, h = max(40, int(w)), max(20, int(h))
             ox = max(0, (W - (cols * w + (cols - 1) * G)) // 2)
+            oy = max(0, (H - (rows * (h + CAP) + G * (rows - 1))) // 2)
             for i, p in enumerate(order):
                 r, k = divmod(i, cols)
-                rects[p] = (ox + k * (w + G), r * (h + CAP + G), w, h)
+                rects[p] = (ox + k * (w + G), oy + r * (h + CAP + G), w, h)
         else:
             self.stage.place_forget()
         for pid, t in self.tiles.items():
@@ -8612,12 +9234,24 @@ class MultiViewPage(Page):
                 x, y, w, h = rects[pid]
                 t["frame"].place(x=x, y=y)
                 t["frame"].place_configure(width=w, height=h + CAP)
-                t["view"].place(x=3, y=3, width=max(1, w - 6), height=max(1, h - 3))
-                t["cap"].place(x=8, y=h + 2)
-                t["cap"].place_configure(width=max(1, w - 16), height=CAP - 6)
+                vh = max(1, h - (3 if CAP else 6))
+                t["view"].place(x=3, y=3, width=max(1, w - 6), height=vh)
+                if CAP:
+                    t["cap"].place(x=8, y=h + 2)
+                    t["cap"].place_configure(width=max(1, w - 16), height=CAP - 6)
+                    self.fit_caption(t, w)
+                else:
+                    t["cap"].place_forget()
             else:
                 t["frame"].place_forget()
         self.update_idletasks()
+        for pid in rects:
+            c = self.client(pid)
+            t = self.tiles.get(pid)
+            if c and t and c.get("mv_embed") and c["hwnd"] and user32.IsWindow(c["hwnd"]):
+                vw = max(1, t["view"].winfo_width())
+                vh = max(1, t["view"].winfo_height())
+                win_place(c["hwnd"], 0, 0, vw, vh)
         self.sync()
 
     # ---- stage (the one window you can play)
@@ -8626,6 +9260,10 @@ class MultiViewPage(Page):
         if not (c and t and c["hwnd"]) or self.stage_pid == pid:
             return
         self.unstage(redraw=False)
+        if c.get("mv_embed"):
+            self.unembed_tile(pid, repark=False)
+        self.focus_pid = None
+        self.apply_focus()
         self.drop_thumb(pid)
         self.park(c)
         self.stage_pid = pid
@@ -8651,6 +9289,9 @@ class MultiViewPage(Page):
             release_window(c["hwnd"], self.stage_saved)
         if c:
             c["embedded"] = False
+            if self._kb_hwnd == c["hwnd"]:
+                self.release_keyboard()
+        self._stage_key = False
         self.stage_pid = self.stage_saved = None
         self.back.pack_forget()
         self.stage.place_forget()
@@ -8663,14 +9304,19 @@ class MultiViewPage(Page):
             return
         if self.stage_pid == pid:
             self.unstage()
+        self.unembed_tile(pid, repark=True)
         self.drop_thumb(pid)
         self.unpark(c)
         t["detached"] = True
+        if self.focus_pid == pid:
+            self.focus_pid = None
+            self.apply_focus()
         if c["hwnd"]:
             win_focus(c["hwnd"])
 
     def restore_all(self):
         self.unstage(redraw=False)
+        self.unembed_all(repark=False)
         for pid in list(self.thumbs):
             self.drop_thumb(pid)
         for c in self.core.snapshot():
@@ -8678,6 +9324,9 @@ class MultiViewPage(Page):
                 self.unpark(c)
         for t in self.tiles.values():
             t["detached"] = False
+        self.embed_failed.clear()
+        self.release_keyboard()
+        self._stage_key = False
 
     def release_all(self):
         self.restore_all()
@@ -8692,6 +9341,8 @@ class MultiViewPage(Page):
     def on_enter(self):
         self.active = True
         self.after(60, self.schedule)
+        if self.cfg.get("live"):
+            self.after(220, self.embed_all)
 
     def on_leave(self):
         self.restore_all()
@@ -8716,8 +9367,15 @@ class MultiViewPage(Page):
                     user32.GetCursorPos(ctypes.byref(pt))
                     under = user32.WindowFromPoint(pt)
                     if under and (under == c["hwnd"] or user32.IsChild(c["hwnd"], under)):
-                        if (user32.GetFocus() or 0) != c["hwnd"]:
-                            user32.SetFocus(c["hwnd"])
+                        if not self._stage_key:
+                            self.grab_keyboard(c["hwnd"])
+                            self._stage_key = True
+                    elif self._stage_key:
+                        self._stage_key = False
+                        self.release_keyboard()
+            elif self._stage_key:
+                self._stage_key = False
+                self.release_keyboard()
         except Exception:
             pass
         self.after(120 if busy else 1000, self.follow)
@@ -8730,15 +9388,64 @@ class MultiViewPage(Page):
         lab.place(relx=0.5, rely=0.5, anchor="center")
         cap = ctk.CTkFrame(f, fg_color="transparent")
         pid = c["pid"]
-        L(cap, c["name"], 12, True).pack(side="left")
+        name = L(cap, c["name"], 12, True, anchor="w")
+        name.pack(side="left")
         pl = pill(cap, "…", T["muted"])
         pl.pack(side="left", padx=6)
-        btn(cap, "✕", lambda: self.core.close_client(pid), "danger", w=30, h=26).pack(side="right")
-        btn(cap, "⧉", lambda: self.to_desktop(pid), "ghost", w=30, h=26).pack(side="right", padx=4)
-        btn(cap, "▶ Play", lambda: self.play(pid), "accent", w=70, h=26).pack(side="right")
+        close = btn(cap, "✕", lambda: self.core.close_client(pid), "danger", w=30, h=26)
+        close.pack(side="right")
+        desk = btn(cap, "⧉", lambda: self.to_desktop(pid), "ghost", w=30, h=26)
+        desk.pack(side="right", padx=4)
+        play = btn(cap, "▶ Play", lambda: self.play(pid), "accent", w=70, h=26)
+        play.pack(side="right")
         for w in (view, lab):
-            w.bind("<Button-1>", lambda e, p=pid: self.play(p))
-        self.tiles[pid] = {"frame": f, "view": view, "lab": lab, "cap": cap, "pill": pl, "detached": False}
+            w.bind("<Button-1>", lambda e, p=pid: self.tile_click(p))
+        cap.bind("<Button-1>", lambda e, p=pid: self.focus_tile(p) if self.cfg.get("live") else None, add="+")
+        menu = tk.Menu(self, tearoff=0, bg=T["panel"], fg=T["text"], activebackground=T["accent"],
+                       activeforeground="#FFFFFF", bd=1, relief="solid")
+        menu.add_command(label="▶  Play on stage", command=lambda p=pid: self.play(p))
+        menu.add_command(label="▣  Use in this tile", command=lambda p=pid: self.run_in_tile(p))
+        menu.add_command(label="Show on desktop", command=lambda p=pid: self.to_desktop(p))
+        menu.add_separator()
+        menu.add_command(label="Close client", command=lambda p=pid: self.core.close_client(p))
+
+        def popup(e, m=menu):
+            try:
+                m.tk_popup(e.x_root, e.y_root)
+            finally:
+                m.grab_release()
+
+        for w in (f, view, lab, cap):
+            w.bind("<Button-3>", popup, add="+")
+        self.tiles[pid] = {"frame": f, "view": view, "lab": lab, "cap": cap, "pill": pl,
+                           "name": name, "play": play, "desk": desk, "close": close,
+                           "cmode": None, "detached": False, "fill": None, "menu": menu}
+
+    def fit_caption(self, t, w):
+        """Captions stay usable when the grid gets dense: compact buttons first, then icon-only play."""
+        wide = w >= 310
+        # Reserve room for the status pill as well as the buttons, otherwise pack silently squeezes it to 1 px.
+        try:
+            t["name"].configure(width=max(40, min(260, w - 16 - (138 if wide else 74) - (68 if wide else 0) - 10)))
+        except Exception:
+            pass
+        mode = (wide, w >= 180)
+        if t.get("cmode") == mode:
+            return
+        t["cmode"] = mode
+        for b in (t["close"], t["desk"], t["play"]):
+            b.pack_forget()
+        t["name"].pack_forget()
+        t["pill"].pack_forget()
+        if w >= 180:
+            t["name"].pack(side="left")
+        t["close"].pack(side="right")
+        if wide:
+            t["desk"].pack(side="right", padx=4)
+        t["play"].configure(text="▶ Play" if wide else "▶", width=70 if wide else 38)
+        t["play"].pack(side="right")
+        if wide:
+            t["pill"].pack(side="left", padx=6)
 
     def refresh(self):
         cl = sorted(self.core.snapshot(), key=lambda c: c["start"])
@@ -8747,15 +9454,25 @@ class MultiViewPage(Page):
         for pid in list(self.tiles):
             if pid not in alive:
                 self.drop_thumb(pid)
+                self.tile_saved.pop(pid, None)
+                self.embed_failed.discard(pid)
+                if self.focus_pid == pid:
+                    self.focus_pid = None
                 if self.stage_pid == pid:
                     self.stage_pid = self.stage_saved = None
                     self.back.pack_forget()
                     self.stage.place_forget()
-                self.tiles.pop(pid)["frame"].destroy()
+                dead = self.tiles.pop(pid)
+                dead["frame"].destroy()
+                try:
+                    dead["menu"].destroy()
+                except Exception:
+                    pass
                 self.orig.pop(pid, None)
                 changed = True
         for c in cl:
             if c["pid"] not in self.tiles:
+                self.embed_failed.discard(c["pid"])
                 self.make_tile(c)
                 changed = True
         order = [c["pid"] for c in cl]
@@ -8770,8 +9487,12 @@ class MultiViewPage(Page):
             if self.active and c["hwnd"] and not t["detached"] and not c.get("embedded") and not c.get("mv"):
                 self.park(c)
                 changed = True
+            if self.live_on() and c["hwnd"] and not t["detached"] and not c.get("embedded") \
+                    and not c.get("mv_embed"):
+                if self.embed_tile(c["pid"]):
+                    changed = True
             state = win_state(c["hwnd"])
-            if c.get("embedded"):
+            if c.get("embedded") or c.get("mv_embed"):
                 txt, col = "Playing", OK
             elif state == "Not responding":
                 txt, col = "Not responding", BAD
@@ -8922,12 +9643,12 @@ class PerfPage(Page):
         glyphs = {"smooth": "≈", "balanced": "◐", "low": "▽", "ultra": "▽", "minimal": "◻",
                   "lowest": "▁", "custom": "✦"}
         info = {"balanced": ("Balanced", "Windows defaults. Nothing is throttled."),
-                "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients in efficiency mode."),
-                "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, efficiency mode, {max(1, NCPU // 2)} core(s) each, power-saving GPU."),
-                "minimal": ("Minimal", "10% CPU cap, 320×180, 15 FPS, graphics 1/10, 1 core each, efficiency mode, memory trim. As light as it gets."),
-                "lowest": ("Lowest", "5% CPU, 5% GPU, 200 MB RAM max per client, 45 FPS cap, 320×180, graphics 1/10, 1 core, efficiency mode."),
+                "low": ("Low resource", "50% CPU cap per client, 640×360 windows, 30 FPS, graphics 3/10, background clients get below-normal priority and efficiency mode."),
+                "ultra": ("Ultra low", f"25% CPU cap, 480×270, 20 FPS, graphics 1/10, {min(NCPU, max(MIN_CORES, NCPU // 2))} core(s) each, background throttling, power-saving GPU. No RAM cap and no trimming."),
+                "minimal": ("Minimal", f"25% CPU cap, 320×180, 15 FPS, graphics 1/10, {min(NCPU, MIN_CORES)} core(s) each, background throttling. No RAM cap, no trimming."),
+                "lowest": ("Lowest", "AUTO CPU that never starves a client, 320×180, 30 FPS, graphics 1/10, all cores, background throttling. No RAM cap, no trimming, no forced window shrinking."),
                 "smooth": ("Smooth", "Adapts live: each client gets just enough CPU not to stutter, windows shrink only when the GPU is busy, 45 FPS cap, graphics 1/10. No RAM cap, so no swapping."),
-                "custom": ("Custom", "Every option below, your values.")}
+                "custom": ("Custom", "Every option below, your values. Safety floors still apply.")}
         for i, k in enumerate(("smooth", "balanced", "low", "ultra", "minimal", "lowest", "custom")):
             f = card(row)
             if k == "custom":
@@ -8943,7 +9664,7 @@ class PerfPage(Page):
             if k == "smooth":
                 pill(hdr, "AUTO", T["lav"]).pack(side="right")
             elif k == "lowest":
-                pill(hdr, "5%", BAD).pack(side="right")
+                pill(hdr, "SAFE", OK).pack(side="right")
             chk = L(hdr, "", 11, True, color=T["accent"])
             chk.pack(side="right", padx=(0, 3))
             self.pchecks[k] = chk
@@ -8966,30 +9687,39 @@ class PerfPage(Page):
         b = ctk.CTkFrame(sc, fg_color="transparent")
         b.grid(row=0, column=1, sticky="nsew", padx=10)
         self.cw = []
+
+        def floor_num(key, lo, hi, floor):
+            v = db.num(key, lo, hi)
+            return max(floor, v) if v > 0 else 0
+
         L(a, "C P U   A N D   M E M O R Y", 9, True, color=T["lav"]).pack(anchor="w", pady=(4, 6))
         r = ctk.CTkFrame(a, fg_color="transparent")
         r.pack(fill="x", pady=4)
         L(r, "Process priority", 12).pack(side="left")
         self.prio = OM(r, ["Normal", "Below normal", "Idle"], width=150)
-        self.prio.set(db.get("c_prio"))
+        prio0 = db.get("c_prio")
+        self.prio.set("Below normal" if prio0 == "Idle" else prio0 if prio0 in ("Normal", "Below normal") else "Normal")
         self.prio.pack(side="right")
         self.cw.append(self.prio)
         self.eco = SW(a, "Efficiency mode (Windows EcoQoS)")
         self.bg_ = SW(a, "Throttle background clients (not the focused one)")
-        self.trim = SW(a, "Trim memory of background clients every minute")
+        self.trim = SW(a, "Trim background clients only when memory is tight")
         self.mem = SW(a, "Low memory priority")
         for sw, key in ((self.eco, "p_eco"), (self.bg_, "p_bg"), (self.trim, "p_trim"), (self.mem, "p_mem")):
             sw.pack(anchor="w", pady=5)
             if db.flag(key):
                 sw.select()
             self.cw.append(sw)
-        self.cores = slider_row(a, "Limit each client to N CPU cores (0 = all)", 0, NCPU, NCPU, db.num("p_cores", 0, NCPU),
+        self.cores = slider_row(a, "Limit each client to N CPU cores (0 = all)", 0, NCPU, NCPU,
+                                floor_num("p_cores", 0, NCPU, min(NCPU, MIN_CORES)),
                                 lambda v: "all cores" if int(v) == 0 else f"{int(v)} of {NCPU}")
         self.cw.append(self.cores)
-        self.cap = slider_row(a, "Hard CPU cap per client (0 = off)", 0, 100, 100, db.num("p_cap", 0, 100),
+        self.cap = slider_row(a, "Hard CPU cap per client (0 = off)", 0, 100, 100,
+                              floor_num("p_cap", 0, 100, MIN_CPU_CAP),
                               lambda v: "off" if int(v) == 0 else f"{int(v)}% of total CPU")
         self.cw.append(self.cap)
-        self.ramcap = slider_row(a, "RAM max per client, MB (0 = off)", 0, 1000, 100, db.num("p_ramcap", 0, 8000),
+        self.ramcap = slider_row(a, "RAM max per client, MB (0 = off)", 0, 4096, 128,
+                                 floor_num("p_ramcap", 0, 4096, MIN_RAM_CAP_MB),
                                  lambda v: "off" if int(v) == 0 else f"up to {int(v)} MB")
         self.cw.append(self.ramcap)
         self.iv = slider_row(a, "Monitoring interval", 1, 15, 14, db.num("interval", 1, 30), lambda v: f"{int(v)} s")
@@ -9003,7 +9733,8 @@ class PerfPage(Page):
         self.cw.append(self.gpu)
         self.gfx = slider_row(b, "Graphics quality (0 = leave as is)", 0, 10, 10, db.num("p_gfx", 0, 10), lambda v: "unchanged" if int(v) == 0 else f"{int(v)} / 10")
         self.fps = slider_row(b, "FPS cap (0 = leave as is)", 0, 240, 24, db.num("p_fps", 0, 240), lambda v: "unchanged" if int(v) == 0 else f"{int(v)} FPS")
-        self.gpucap = slider_row(b, "GPU target per client (0 = off)", 0, 100, 100, db.num("p_gpucap", 0, 100),
+        self.gpucap = slider_row(b, "GPU target per client (0 = off)", 0, 100, 100,
+                                 floor_num("p_gpucap", 0, 100, MIN_GPU_CAP),
                                  lambda v: "off" if int(v) == 0 else f"{int(v)}% max")
         self.cw += [self.gfx, self.fps, self.gpucap]
         r = ctk.CTkFrame(b, fg_color="transparent")
@@ -9024,7 +9755,8 @@ class PerfPage(Page):
         self.automin.pack(anchor="w", pady=6)
         self.cw.append(self.automin)
         L(sc, "How it works: documented Windows settings only (priority class, EcoQoS efficiency mode, memory priority, CPU core limit, a Windows job-object hard CPU cap, working-set trim, per-app GPU preference) plus Roblox's own graphics-quality and FPS-cap settings, written to each account's isolated profile (or, without isolation, while no client is running; a backup is kept).\n"
-              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target. The RAM limit is a hard working-set cap: Windows keeps at most that much of a client in physical memory and moves the rest to the page file, so very low limits make Roblox slow and disk-heavy.",
+              "If Windows or Roblox refuses a setting for a client, it is skipped and shown in the Play log. Windows has no hard GPU cap for another program, so the GPU target is enforced by measuring each client's GPU use (Windows performance counters) every few seconds and shrinking or growing its window to stay under the target.\n"
+              f"Safety floors always apply: a RAM cap is at least {MIN_RAM_CAP_MB} MB, a CPU cap at least {MIN_CPU_CAP}% of total CPU, core limits at least {min(NCPU, MIN_CORES)} core(s), and a GPU target at least {MIN_GPU_CAP}%. A hard RAM cap below 1 GB makes Windows page Roblox constantly, which is slower than leaving the cap off.",
           11, muted=True, wraplength=900, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         bar = ctk.CTkFrame(body, fg_color="transparent")
         bar.grid(row=2, column=0, sticky="ew")
@@ -9094,14 +9826,25 @@ class PerfPage(Page):
 
     def save(self):
         db = self.core.db
+
+        def clamped(slider, floor):
+            v = int(slider.get())
+            v = max(floor, v) if v > 0 else 0
+            slider.set(v)
+            try:
+                slider._value_label.configure(text=slider._fmt(v))
+            except Exception:
+                pass
+            return v
+
         db.set("preset", self.sel)
         db.set("c_prio", self.prio.get())
         for sw, key in ((self.eco, "p_eco"), (self.bg_, "p_bg"), (self.trim, "p_trim"), (self.mem, "p_mem")):
             db.set(key, "1" if sw.get() else "0")
-        db.set("p_cores", int(self.cores.get()))
-        db.set("p_cap", int(self.cap.get()))
-        db.set("p_gpucap", int(self.gpucap.get()))
-        db.set("p_ramcap", int(self.ramcap.get()))
+        db.set("p_cores", clamped(self.cores, min(NCPU, MIN_CORES)))
+        db.set("p_cap", clamped(self.cap, MIN_CPU_CAP))
+        db.set("p_gpucap", clamped(self.gpucap, MIN_GPU_CAP))
+        db.set("p_ramcap", clamped(self.ramcap, MIN_RAM_CAP_MB))
         db.set("interval", int(self.iv.get()))
         db.set("p_gpu", {"System default": "default", "Power saving": "power", "High performance": "high"}[self.gpu.get()])
         db.set("p_gfx", int(self.gfx.get()))
